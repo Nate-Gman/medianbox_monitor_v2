@@ -471,6 +471,155 @@ class DNSCache:
             return [(t, s, d) for t, s, d in self.query_log
                     if t > cutoff and keyword in d.lower()]
 
+    # --- Windows DNS client cache polling ---
+    def poll_system_dns_cache(self):
+        """Harvest IP→domain mappings from the Windows DNS client cache.
+        Uses ipconfig /displaydns with CNAME chain tracking, then
+        PowerShell Get-DnsClientCache for richer data."""
+        added = 0
+        added += self._poll_ipconfig_displaydns()
+        added += self._poll_powershell_dns_cache()
+        if added:
+            _logger.debug("DNS cache poll: added %d new IP→domain mappings total", added)
+
+    def _add_domain_ip(self, ip_str: str, domain: str) -> bool:
+        """Add a single IP→domain mapping. Returns True if new."""
+        domain = domain.rstrip('.').lower()
+        if not domain or not ip_str:
+            return False
+        with self.lock:
+            if domain not in self.ip_to_domains.get(ip_str, set()):
+                self.ip_to_domains[ip_str].add(domain)
+                self.domain_to_ips[domain].add(ip_str)
+                return True
+        return False
+
+    def _poll_ipconfig_displaydns(self) -> int:
+        """Parse 'ipconfig /displaydns' with CNAME chain resolution."""
+        try:
+            result = subprocess.run(
+                ['ipconfig', '/displaydns'],
+                capture_output=True, text=True, timeout=10,
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+            )
+            if result.returncode != 0:
+                return 0
+            # Pass 1: collect all record names → A/AAAA IPs and CNAME targets
+            current_name = None
+            a_records = {}      # record_name → set of IPs
+            cname_map = {}      # cname_target → set of original names that point to it
+            for line in result.stdout.splitlines():
+                stripped = line.strip()
+                if stripped.startswith('Record Name'):
+                    parts = stripped.split(':', 1)
+                    if len(parts) == 2:
+                        current_name = parts[1].strip().rstrip('.').lower()
+                elif current_name:
+                    if 'A (Host) Record' in stripped or 'AAAA' in stripped:
+                        parts = stripped.split(':', 1)
+                        if len(parts) == 2:
+                            ip_str = parts[1].strip()
+                            try:
+                                ipaddress.ip_address(ip_str)
+                                a_records.setdefault(current_name, set()).add(ip_str)
+                            except ValueError:
+                                pass
+                    elif 'CNAME Record' in stripped:
+                        parts = stripped.split(':', 1)
+                        if len(parts) == 2:
+                            target = parts[1].strip().rstrip('.').lower()
+                            cname_map.setdefault(target, set()).add(current_name)
+            # Pass 2: for each A record, follow CNAME chains back to original names
+            added = 0
+            for record_name, ips in a_records.items():
+                # Collect all names that resolve to these IPs (including CNAME sources)
+                all_names = {record_name}
+                queue = [record_name]
+                visited = set()
+                while queue:
+                    name = queue.pop()
+                    if name in visited:
+                        continue
+                    visited.add(name)
+                    # Find names that CNAME to this name
+                    for source in cname_map.get(name, set()):
+                        all_names.add(source)
+                        queue.append(source)
+                for ip_str in ips:
+                    for name in all_names:
+                        if self._add_domain_ip(ip_str, name):
+                            added += 1
+            return added
+        except Exception as exc:
+            _logger.debug("ipconfig /displaydns parse error: %s", exc)
+            return 0
+
+    def _poll_powershell_dns_cache(self) -> int:
+        """Use PowerShell Get-DnsClientCache for richer DNS data with original query names."""
+        try:
+            cmd = (
+                'Get-DnsClientCache -Status Success -ErrorAction SilentlyContinue '
+                '| Where-Object { $_.Type -in 1,28 } '
+                '| Select-Object -Property Entry,Data '
+                '| Format-Table -HideTableHeaders -AutoSize'
+            )
+            result = subprocess.run(
+                ['powershell', '-NoProfile', '-NonInteractive', '-Command', cmd],
+                capture_output=True, text=True, timeout=15,
+                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+            )
+            if result.returncode != 0:
+                return 0
+            added = 0
+            for line in result.stdout.splitlines():
+                parts = line.split()
+                if len(parts) >= 2:
+                    entry = parts[0].strip().rstrip('.').lower()
+                    ip_str = parts[-1].strip()
+                    try:
+                        ipaddress.ip_address(ip_str)
+                        if self._add_domain_ip(ip_str, entry):
+                            added += 1
+                    except ValueError:
+                        pass
+            return added
+        except Exception as exc:
+            _logger.debug("PowerShell DNS cache error: %s", exc)
+            return 0
+
+    # --- Persistent domain history ---
+    _HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.dns_domain_history.json')
+
+    def save_history(self):
+        """Persist all IP→domain mappings to disk so they survive restarts."""
+        try:
+            with self.lock:
+                data = {ip: sorted(doms) for ip, doms in self.ip_to_domains.items() if doms}
+            with open(self._HISTORY_FILE, 'w') as f:
+                json.dump(data, f)
+        except Exception as exc:
+            _logger.debug("DNS history save error: %s", exc)
+
+    def load_history(self):
+        """Load persisted IP→domain mappings from a previous session."""
+        try:
+            if not os.path.exists(self._HISTORY_FILE):
+                return
+            with open(self._HISTORY_FILE, 'r') as f:
+                data = json.load(f)
+            added = 0
+            with self.lock:
+                for ip, doms in data.items():
+                    for d in doms:
+                        if d not in self.ip_to_domains.get(ip, set()):
+                            self.ip_to_domains[ip].add(d)
+                            self.domain_to_ips[d].add(ip)
+                            added += 1
+            if added:
+                _logger.debug("DNS history: loaded %d IP→domain mappings from disk", added)
+        except Exception as exc:
+            _logger.debug("DNS history load error: %s", exc)
+
 
 class DNSTunnelingDetector:
     """Detects data exfiltration via DNS queries (long subdomains, high entropy, high rate)."""
@@ -2595,7 +2744,7 @@ class PacketPipeline:
 
 # ========================== SERVICE RESOLVER ==========================
 SERVICE_PATTERNS = [
-    (r'youtube|googlevideo|ytimg|yt\d', 'YouTube', 'Streaming', '🎬'),
+    (r'youtube|googlevideo|ytimg|yt\d|ggpht', 'YouTube', 'Streaming', '🎬'),
     (r'netflix|nflxvideo|nflximg|nflxso|nflxext', 'Netflix', 'Streaming', '🎬'),
     (r'disneyplus|disney-plus|bamgrid|dssott', 'Disney+', 'Streaming', '🎬'),
     (r'hulu|hulustream', 'Hulu', 'Streaming', '🎬'),
@@ -2618,7 +2767,7 @@ SERVICE_PATTERNS = [
     (r'whatsapp|wa\.me', 'WhatsApp', 'Communication', '💬'),
     (r'signal\.org|signal-cdn', 'Signal', 'Communication', '💬'),
     (r'telegram\.org|t\.me|telegram-cdn', 'Telegram', 'Communication', '💬'),
-    (r'google\.com|googleapis|gstatic|goog\b|google-analytics|googleusercontent', 'Google', 'Tech', '🔍'),
+    (r'google\.com|googleapis|gstatic|goog\b|google-analytics|googleusercontent|1e100\.net', 'Google', 'Tech', '🔍'),
     (r'bing\.com|bingapis|msn\.com', 'Microsoft Bing', 'Tech', '🔍'),
     (r'duckduckgo', 'DuckDuckGo', 'Tech', '🔍'),
     (r'cloudflare|cf-|one\.one\.one', 'Cloudflare', 'CDN/Cloud', '☁️'),
@@ -2671,6 +2820,12 @@ SERVICE_PATTERNS = [
 _COMPILED_PATTERNS = [(re.compile(pat, re.IGNORECASE), name, cat, icon)
                       for pat, name, cat, icon in SERVICE_PATTERNS]
 
+# Services that are broad infrastructure providers — more specific matches should override these
+_GENERIC_SERVICES = frozenset({
+    'Google', 'Microsoft', 'Apple', 'Amazon AWS', 'Google Cloud',
+    'Microsoft Azure', 'Cloudflare', 'Akamai CDN', 'Fastly CDN',
+})
+
 
 class ServiceResolver:
     """Resolves IPs and domains to human-readable service names with caching."""
@@ -2678,6 +2833,32 @@ class ServiceResolver:
         self._rdns_cache: dict[str, str] = {}
         self._service_cache: dict[str, dict] = {}
         self.lock = threading.Lock()
+
+    @staticmethod
+    def _is_unresolved(service: str) -> bool:
+        """True if service is just an IP, 'Unknown', or empty — needs re-resolution."""
+        if not service or service == 'Unknown':
+            return True
+        try:
+            ipaddress.ip_address(service)
+            return True
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _pick_best_website_domain(candidates: list[str]) -> str:
+        """From a list of raw website domains, pick the most readable one."""
+        if not candidates:
+            return ''
+        # Prefer shortest non-www, non-cdn domain; fall back to shortest overall
+        clean = []
+        for d in candidates:
+            low = d.lower()
+            if not low.startswith(('www.', 'cdn.', 'static.', 'assets.', 'img.', 'images.',
+                                   'api.', 'edge.', 'media.', 'dl.', 'download.')):
+                clean.append(d)
+        pool = clean or candidates
+        return min(pool, key=len)
 
     def resolve_domain(self, domain: str) -> dict:
         if not domain:
@@ -2706,21 +2887,89 @@ class ServiceResolver:
         with self.lock:
             cached = self._service_cache.get(ip)
             if cached:
-                return cached
+                svc = cached.get('service', '')
+                # Return immediately only for specific known services (non-generic, non-placeholder)
+                if svc and svc not in _GENERIC_SERVICES and not self._is_unresolved(svc):
+                    # CDN hostnames should always allow re-evaluation
+                    svc_lower = svc.lower()
+                    is_cdn_svc = any(cdn in svc_lower for cdn in (
+                        'cloudfront', 'akamai', 'fastly', 'cloudflare', 'amazonaws',
+                        'azureedge', 'edgecast', 'hwcdn', 'edgesuite', 'akamaiedge',
+                        'server-', 'deploy.static', 'compute-1.', '.elb.',
+                        '1e100.net', 'fbcdn', 'googleusercontent',
+                    ))
+                    if is_cdn_svc:
+                        if not domains:
+                            return cached
+                        # Fall through to re-evaluate with new domains
+                    elif domains:
+                        # Check if we already have a website domain or a pattern-matched service
+                        resolved = self.resolve_domain(cached.get('domain', ''))
+                        if resolved.get('service') != cached.get('domain', '').lower():
+                            # It's a pattern-matched service like YouTube — keep it
+                            return cached
+                        # It's a website domain (pornhub.com) — check if a better specific match exists
+                    else:
+                        return cached
+                if not domains:
+                    return cached
         if domains:
+            specific_match = None      # YouTube, Netflix, Discord, etc.
+            specific_domain = None
+            generic_match = None       # Google, Cloudflare, Akamai, etc.
+            generic_domain = None
+            website_domains = []       # pornhub.com, yahoo.com — actual sites
+
             for d in domains:
                 result = self.resolve_domain(d)
-                if result['service'] != d.lower():
-                    result['domain'] = d
-                    with self.lock:
-                        self._service_cache[ip] = result
-                    return result
+                is_pattern_match = (result['service'] != d.lower())
+                if is_pattern_match:
+                    if result['service'] not in _GENERIC_SERVICES:
+                        # Specific known service — best possible match
+                        if specific_match is None:
+                            specific_match = result
+                            specific_domain = d
+                    else:
+                        if generic_match is None:
+                            generic_match = result
+                            generic_domain = d
+                else:
+                    # No pattern matched — this IS the actual website domain
+                    website_domains.append(d)
+
+            # Priority: specific service > website domain > generic CDN
+            if specific_match:
+                specific_match['domain'] = specific_domain
+                if generic_match:
+                    specific_match['via'] = generic_match['service']
+                with self.lock:
+                    self._service_cache[ip] = specific_match
+                return specific_match
+
+            if website_domains:
+                best_domain = self._pick_best_website_domain(website_domains)
+                result = {'service': best_domain, 'category': 'Website', 'icon': '🌐',
+                          'domain': best_domain, 'via': ''}
+                if generic_match:
+                    result['via'] = generic_match['service']
+                with self.lock:
+                    self._service_cache[ip] = result
+                return result
+
+            if generic_match:
+                generic_match['domain'] = generic_domain
+                with self.lock:
+                    self._service_cache[ip] = generic_match
+                return generic_match
+
+            # All domains were unrecognized duplicates of themselves — use first
             first_domain = next(iter(domains))
             result = {'service': first_domain, 'category': 'Other', 'icon': '🌐',
-                      'domain': first_domain}
+                      'domain': first_domain, 'via': ''}
             with self.lock:
                 self._service_cache[ip] = result
             return result
+
         rdns = self.reverse_dns(ip)
         if rdns:
             result = self.resolve_domain(rdns)
@@ -2745,16 +2994,21 @@ class ServiceResolver:
 class ConnectionEntry:
     """Single tracked connection with full metadata."""
     __slots__ = (
-        'category', 'city', 'country', 'country_code', 'domain',
-        'first_seen', 'icon', 'isp', 'last_seen', 'lat', 'local_port',
-        'loc_confidence', 'loc_grade', 'loc_proof',
-        'lon', 'org', 'pid', 'process_name', 'protocol', 'proxy_detail',
+        'all_domains', 'category', 'city', 'cmdline', 'country', 'country_code',
+        'domain', 'exe_path', 'first_seen', 'icon', 'isp', 'last_seen', 'lat',
+        'local_port', 'loc_confidence', 'loc_grade', 'loc_proof', 'lon', 'org',
+        'parent_name', 'pid', 'process_name', 'protocol', 'proxy_detail',
         'proxy_type', 'region', 'remote_ip', 'remote_port', 'service', 'status',
+        'via', 'website_tag',
     )
 
     def __init__(self):
         self.pid = 0
         self.process_name = ''
+        self.exe_path = ''
+        self.parent_name = ''
+        self.cmdline = ''
+        self.website_tag = ''
         self.remote_ip = ''
         self.remote_port = 0
         self.local_port = 0
@@ -2764,6 +3018,8 @@ class ConnectionEntry:
         self.category = 'Unknown'
         self.icon = '❓'
         self.domain = ''
+        self.all_domains: list = []
+        self.via = ''
         self.country = '??'
         self.country_code = '??'
         self.city = '??'
@@ -2783,10 +3039,13 @@ class ConnectionEntry:
     def to_dict(self) -> dict:
         return {
             'pid': self.pid, 'process': self.process_name,
+            'exe_path': self.exe_path, 'parent_name': self.parent_name,
+            'cmdline': self.cmdline, 'website_tag': self.website_tag,
             'remote_ip': self.remote_ip, 'remote_port': self.remote_port,
             'local_port': self.local_port, 'protocol': self.protocol,
             'status': self.status, 'service': self.service,
             'category': self.category, 'icon': self.icon, 'domain': self.domain,
+            'all_domains': list(self.all_domains), 'via': self.via,
             'country': self.country, 'country_code': self.country_code,
             'city': self.city, 'region': self.region,
             'org': self.org, 'isp': self.isp,
@@ -2834,6 +3093,99 @@ class ConnectionInventory:
             _logger.debug("Connection inventory scan error: %s", exc)
             return []
 
+    _CDN_HOSTNAME_PATTERNS = (
+        'cloudfront', 'akamai', 'fastly', 'cloudflare', 'amazonaws',
+        'azureedge', 'edgecast', 'cdn.', 'deploy.static', 'compute-1.',
+        'elb.', 'server-', '.r.cloudfront', 'hwcdn', 'edgesuite',
+        'akadns', 'akamaiedge', 'azurefd', 'trafficmanager', 'msedge.net',
+        'footprint.net', 'fpbns.net', 'nsatc.net', 'nflxvideo',
+        'llnwd.net', 'lldns.net', 'edgekey', 'akamaihd', 'akamaitechnologies',
+        'cloudapp.net', 'azure.com', 'googleusercontent', '1e100.net',
+        'gstatic', 'ggpht', 'fbcdn', 'facebook.net', 'xx.fbcdn',
+    )
+
+    @staticmethod
+    def _is_cdn_hostname(domain: str) -> bool:
+        dl = domain.lower()
+        return any(cdn in dl for cdn in ConnectionInventory._CDN_HOSTNAME_PATTERNS)
+
+    @staticmethod
+    def _compute_website_tag(entry) -> str:
+        """Best-effort human-readable label for WHAT WEBSITE this connection is for."""
+        svc = entry.service
+        dom = entry.domain
+        via = entry.via
+        all_doms = entry.all_domains
+        # If service is a known specific service (YouTube, Netflix, etc.) use it
+        if svc and svc not in _GENERIC_SERVICES and not ServiceResolver._is_unresolved(svc):
+            tag = svc
+            if via:
+                tag += f" (via {via})"
+            return tag
+        # If we have real website domains, pick the best one
+        if all_doms:
+            real_sites = [d for d in all_doms
+                          if not ConnectionInventory._is_cdn_hostname(d)]
+            if real_sites:
+                # Prefer shortest non-www domain as it's usually the apex
+                def _score(d):
+                    d_lower = d.lower()
+                    # Prefer shorter domains (apex like amazon.com over sub.amazon.com)
+                    parts = d_lower.split('.')
+                    return (len(parts), len(d_lower))
+                best = min(real_sites, key=_score)
+                tag = best
+                if via:
+                    tag += f" (via {via})"
+                elif svc in _GENERIC_SERVICES:
+                    tag += f" (via {svc})"
+                return tag
+        # Fall back: use domain if it's not just an IP
+        if dom and not ServiceResolver._is_unresolved(dom) and dom != entry.remote_ip:
+            # Even CDN hostname is better than nothing — show with org
+            org = entry.org if hasattr(entry, 'org') and entry.org != 'Unknown' else ''
+            if ConnectionInventory._is_cdn_hostname(dom) and org:
+                return f"[{org}] {dom}"
+            return dom
+        # Use service + org for context
+        if svc and not ServiceResolver._is_unresolved(svc):
+            org = entry.org if hasattr(entry, 'org') and entry.org != 'Unknown' else ''
+            if org and org.lower() not in svc.lower():
+                return f"{svc} ({org})"
+            return svc
+        # Absolute fallback: IP + org
+        org = entry.org if hasattr(entry, 'org') and entry.org != 'Unknown' else ''
+        if org:
+            return f"{entry.remote_ip} ({org})"
+        return entry.remote_ip
+
+    @staticmethod
+    def _get_process_detail(pid: int) -> dict:
+        """Gather full process detail for a PID: name, exe path, parent, cmdline."""
+        info = {'name': f'PID:{pid}', 'exe_path': '', 'parent_name': '', 'cmdline': ''}
+        try:
+            proc = psutil.Process(pid)
+            info['name'] = proc.name()
+            try:
+                info['exe_path'] = proc.exe() or ''
+            except (psutil.AccessDenied, psutil.NoSuchProcess):
+                pass
+            try:
+                parent = proc.parent()
+                if parent:
+                    info['parent_name'] = parent.name()
+            except (psutil.AccessDenied, psutil.NoSuchProcess):
+                pass
+            try:
+                cmdline = proc.cmdline()
+                if cmdline:
+                    info['cmdline'] = ' '.join(cmdline)[:300]
+            except (psutil.AccessDenied, psutil.NoSuchProcess):
+                pass
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+        return info
+
     def scan(self):
         now = time.time()
         active_keys = set()
@@ -2852,12 +3204,43 @@ class ConnectionInventory:
             active_keys.add(key)
             with self.lock:
                 if key in self.connections:
-                    self.connections[key].last_seen = now
-                    self.connections[key].status = conn.status
+                    entry = self.connections[key]
+                    entry.last_seen = now
+                    entry.status = conn.status
+                    # Always refresh all_domains from DNS cache
+                    fresh_domains = self.dns_cache.get_domains(remote_ip)
+                    if fresh_domains:
+                        entry.all_domains = sorted(fresh_domains)
+                    # Re-resolve service if under-resolved (generic CDN, IP, Unknown, empty domain, CDN hostname)
+                    cur_svc = entry.service
+                    needs_recheck = (
+                        cur_svc in _GENERIC_SERVICES
+                        or ServiceResolver._is_unresolved(cur_svc)
+                        or not entry.domain
+                        or entry.domain == remote_ip
+                        or self._is_cdn_hostname(cur_svc)
+                        or self._is_cdn_hostname(entry.domain)
+                    )
+                    if needs_recheck and fresh_domains:
+                        svc_info = self.resolver.identify(remote_ip, fresh_domains)
+                        new_svc = svc_info.get('service', cur_svc)
+                        if new_svc != cur_svc:
+                            entry.service = new_svc
+                            entry.category = svc_info.get('category', entry.category)
+                            entry.icon = svc_info.get('icon', entry.icon)
+                            entry.domain = svc_info.get('domain', entry.domain)
+                            entry.via = svc_info.get('via', entry.via)
+                    # Recompute website tag every cycle
+                    entry.website_tag = self._compute_website_tag(entry)
                     continue
+            # --- New connection: gather full process detail ---
+            pdetail = self._get_process_detail(pid)
             entry = ConnectionEntry()
             entry.pid = pid
-            entry.process_name = pid_names.get(pid, f'PID:{pid}')
+            entry.process_name = pdetail['name']
+            entry.exe_path = pdetail['exe_path']
+            entry.parent_name = pdetail['parent_name']
+            entry.cmdline = pdetail['cmdline']
             entry.remote_ip = remote_ip
             entry.remote_port = remote_port
             entry.local_port = conn.laddr[1] if conn.laddr else 0
@@ -2871,6 +3254,8 @@ class ConnectionInventory:
             entry.category = svc_info.get('category', 'Unknown')
             entry.icon = svc_info.get('icon', '❓')
             entry.domain = svc_info.get('domain', '')
+            entry.via = svc_info.get('via', '')
+            entry.all_domains = sorted(domains) if domains else []
             if self._is_public(remote_ip):
                 geo = self.geoip.get_full(remote_ip)
                 entry.country = geo.get('country', '??')
@@ -2898,6 +3283,7 @@ class ConnectionInventory:
                     entry.proxy_detail = proxy_info.get('proxy_detail', '')
             except Exception:
                 pass
+            entry.website_tag = self._compute_website_tag(entry)
             with self.lock:
                 if self._is_public(remote_ip):
                     self.total_unique_ips.add(remote_ip)
@@ -2928,6 +3314,9 @@ class ConnectionInventory:
                     seen_ips[entry.remote_ip] = {
                         'ip': entry.remote_ip, 'lat': entry.lat, 'lon': entry.lon,
                         'service': entry.service, 'icon': entry.icon,
+                        'domain': entry.domain,
+                        'all_domains': list(entry.all_domains),
+                        'via': entry.via, 'website_tag': entry.website_tag,
                         'city': entry.city, 'country': entry.country,
                         'org': entry.org, 'process': entry.process_name,
                         'loc_confidence': entry.loc_confidence,
@@ -3116,13 +3505,18 @@ function updateMap(points){
 function popupHtml(p){
   const d=document.createElement('div');
   d.innerHTML='';
+  if(p.website_tag){const wt=document.createElement('b');wt.style.color='#00ff88';wt.textContent='\ud83c\udff7\ufe0f '+p.website_tag;d.appendChild(wt);d.appendChild(document.createElement('br'))}
   const b1=document.createElement('b');b1.textContent=p.service+' '+p.icon;d.appendChild(b1);
   d.appendChild(document.createElement('br'));
+  let domLine=p.domain||'';
+  if(p.via)domLine+=' (via '+p.via+')';
+  if(domLine){const dt=document.createTextNode(domLine);d.appendChild(dt);d.appendChild(document.createElement('br'))}
   const t1=document.createTextNode(p.ip+' ('+p.process+')');d.appendChild(t1);
   d.appendChild(document.createElement('br'));
   const t2=document.createTextNode(p.city+', '+p.country);d.appendChild(t2);
   d.appendChild(document.createElement('br'));
   const sm=document.createElement('small');sm.textContent=p.org+' | '+p.lat.toFixed(4)+', '+p.lon.toFixed(4);d.appendChild(sm);
+  if(p.all_domains&&p.all_domains.length>1){d.appendChild(document.createElement('br'));const ad=document.createElement('small');ad.style.color='#888';ad.textContent='Domains: '+p.all_domains.slice(0,6).join(', ')+(p.all_domains.length>6?' (+'+String(p.all_domains.length-6)+')':'');d.appendChild(ad)}
   return d.innerHTML;
 }
 // === Tab Switching ===
@@ -3149,7 +3543,8 @@ function updateConnections(conns){
     byCat[cat].forEach(c=>{
       const row=document.createElement('div');row.className='conn-row';
       const icon=document.createElement('span');icon.className='conn-icon';icon.textContent=c.icon;
-      const svc=document.createElement('span');svc.className='conn-svc';svc.textContent=c.service;
+      const svc=document.createElement('span');svc.className='conn-svc';svc.textContent=c.service+(c.via?' (via '+c.via+')':'');
+      const dom=document.createElement('span');dom.className='conn-proc';dom.style.color='#888';dom.textContent=c.domain||'';
       const proc=document.createElement('span');proc.className='conn-proc';proc.textContent=c.process;
       const ip=document.createElement('span');ip.className='conn-ip';ip.textContent=c.remote_ip+':'+c.remote_port;
       const geo=document.createElement('span');geo.className='conn-geo';
@@ -3157,7 +3552,7 @@ function updateConnections(conns){
       const coords=document.createElement('span');coords.className='conn-coords';
       coords.textContent=(c.lat||c.lon)?'('+c.lat.toFixed(2)+', '+c.lon.toFixed(2)+')':'';
       const org=document.createElement('span');org.className='conn-org';org.textContent=c.org||'';
-      row.appendChild(icon);row.appendChild(svc);row.appendChild(proc);row.appendChild(ip);
+      row.appendChild(icon);row.appendChild(svc);row.appendChild(dom);row.appendChild(proc);row.appendChild(ip);
       row.appendChild(geo);row.appendChild(coords);row.appendChild(org);body.appendChild(row);
     });
   });
@@ -3912,13 +4307,28 @@ class GNATracerGUI:
             pd = info.get('proxy_detail', '')
             if pd:
                 proxy_line += f"\n  {pd}"
-        text = (f"IP: {ip}\n"
+        domain_str = info.get('domain', '?')
+        via = info.get('via', '')
+        domain_line = f"Domain: {domain_str}"
+        if via:
+            domain_line += f" (via {via})"
+        all_doms = info.get('all_domains', [])
+        all_doms_line = ""
+        if all_doms and len(all_doms) > 1:
+            all_doms_line = f"\nAll Domains: {', '.join(all_doms[:6])}"
+            if len(all_doms) > 6:
+                all_doms_line += f" (+{len(all_doms)-6})"
+        wtag = info.get('website_tag', '')
+        wtag_line = f"🏷️ {wtag}\n" if wtag else ""
+        text = (f"{wtag_line}"
+                f"IP: {ip}\n"
                 f"Service: {info.get('service', '?')}\n"
+                f"{domain_line}\n"
                 f"Process: {info.get('process', '?')}\n"
                 f"City: {info.get('city', '?')}, {info.get('country', '?')}\n"
                 f"Org: {info.get('org', '?')}\n"
                 f"Lat: {info.get('lat', 0):.4f}, Lon: {info.get('lon', 0):.4f}"
-                f"{loc_line}{proof_lines}{proxy_line}\n"
+                f"{all_doms_line}{loc_line}{proof_lines}{proxy_line}\n"
                 f"[Click for full action log]")
         self._show_tooltip(event, text)
 
@@ -3935,13 +4345,31 @@ class GNATracerGUI:
             # Find all connections for this IP
             for conn in data.get('connections', []):
                 if conn.get('remote_ip') == ip:
+                    wtag = conn.get('website_tag', '')
+                    if wtag:
+                        lines.append(f"🏷️ WEBSITE: {wtag}")
                     lines.append(f"Connection: {conn.get('process', '?')} (PID {conn.get('pid', '?')})")
+                    exe_p = conn.get('exe_path', '')
+                    if exe_p:
+                        lines.append(f"  Exe Path: {exe_p}")
+                    parent_n = conn.get('parent_name', '')
+                    if parent_n:
+                        lines.append(f"  Parent: {parent_n}")
                     lines.append(f"  Remote: {ip}:{conn.get('remote_port', '?')}")
                     lines.append(f"  Local Port: {conn.get('local_port', '?')}")
                     lines.append(f"  Protocol: {conn.get('protocol', '?')}")
                     lines.append(f"  Status: {conn.get('status', '?')}")
                     lines.append(f"  Service: {conn.get('service', '?')} ({conn.get('category', '?')})")
-                    lines.append(f"  Domain: {conn.get('domain', '?')}")
+                    via = conn.get('via', '')
+                    domain_info = conn.get('domain', '?')
+                    if via:
+                        domain_info += f" (via {via})"
+                    lines.append(f"  Domain: {domain_info}")
+                    all_doms = conn.get('all_domains', [])
+                    if all_doms:
+                        lines.append(f"  All Domains: {', '.join(all_doms[:10])}")
+                        if len(all_doms) > 10:
+                            lines.append(f"    (+{len(all_doms)-10} more)")
                     lines.append(f"  Country: {conn.get('country', '?')} ({conn.get('country_code', '?')})")
                     lines.append(f"  City: {conn.get('city', '?')}, Region: {conn.get('region', '?')}")
                     lines.append(f"  Org: {conn.get('org', '?')}, ISP: {conn.get('isp', '?')}")
@@ -4046,6 +4474,7 @@ class GNATracerGUI:
             wrap="none", bd=0, highlightthickness=0)
         self._live_text.pack(fill="both", expand=True)
         self._live_buttons: list = []
+        self._live_expanded: dict[str, bool] = {}  # conn_key → expanded?
 
         # === TAB 3: All Connections (each individually) ===
         self._conn_frame = ttk.Frame(nb)
@@ -4459,11 +4888,111 @@ class GNATracerGUI:
             str(c.get('category', '')), str(c.get('country', '')),
             str(c.get('org', '')), str(c.get('isp', '')),
             str(c.get('city', '')), str(c.get('pid', '')),
+            str(c.get('via', '')), str(c.get('website_tag', '')),
+            str(c.get('exe_path', '')), str(c.get('parent_name', '')),
+            ' '.join(str(d) for d in c.get('all_domains', [])),
         ]
         return any(q in f.lower() for f in fields)
 
+    def _live_toggle_conn(self, conn_key: str):
+        """Toggle expand/collapse for a single connection in the live tab."""
+        self._live_expanded[conn_key] = not self._live_expanded.get(conn_key, False)
+        # Force immediate re-render by calling the last cached data
+        if hasattr(self, '_last_live_data') and self._last_live_data is not None:
+            self._refresh_live(self._last_live_data)
+
+    def _live_set_all_expanded(self, expanded: bool):
+        """Set all connections to expanded or collapsed."""
+        if expanded:
+            # Expand everything currently visible
+            if hasattr(self, '_last_live_data') and self._last_live_data is not None:
+                for c in self._last_live_data.get('connections', []):
+                    self._live_expanded[self._live_conn_key(c)] = True
+        else:
+            self._live_expanded.clear()
+        if hasattr(self, '_last_live_data') and self._last_live_data is not None:
+            self._refresh_live(self._last_live_data)
+
+    def _live_toggle_category(self, cat_key: str, conn_keys: list):
+        """Toggle all connections in a category."""
+        # If any are expanded, collapse all; otherwise expand all
+        any_open = any(self._live_expanded.get(k, False) for k in conn_keys)
+        for k in conn_keys:
+            self._live_expanded[k] = not any_open
+        if hasattr(self, '_last_live_data') and self._last_live_data is not None:
+            self._refresh_live(self._last_live_data)
+
+    @staticmethod
+    def _live_conn_key(c: dict) -> str:
+        """Stable key for a connection dict to track expand state."""
+        return f"{c.get('remote_ip', '')}:{c.get('remote_port', '')}:{c.get('pid', '')}"
+
+    def _live_render_detail(self, w, c, risk, risk_tag):
+        """Render the expanded detail lines for a connection."""
+        rip = c.get('remote_ip', '')
+        # === WEBSITE TAG ===
+        wtag = c.get('website_tag', '')
+        if wtag:
+            w.insert("end", f"  │  🏷️ WEBSITE:    ", "")
+            w.insert("end", f"{wtag}\n", "highlight")
+        # === Process detail ===
+        w.insert("end", f"  │     Process:     {c.get('process', '?')} (PID {c.get('pid', '?')})\n")
+        exe_path = c.get('exe_path', '')
+        if exe_path:
+            w.insert("end", f"  │     Exe Path:    {exe_path}\n", "dim")
+        parent = c.get('parent_name', '')
+        if parent:
+            w.insert("end", f"  │     Parent:      {parent}\n", "dim")
+        # === Network detail ===
+        w.insert("end", f"  │     Remote:      {rip}:{c.get('remote_port', '?')}\n")
+        w.insert("end", f"  │     Local Port:  {c.get('local_port', '?')}\n")
+        w.insert("end", f"  │     Protocol:    {c.get('protocol', '?')} — Status: ", "")
+        w.insert("end", f"{c.get('status', '?')}\n", risk_tag)
+        # === Domain detail ===
+        domain_str = c.get('domain', 'unresolved')
+        via = c.get('via', '')
+        if via:
+            w.insert("end", f"  │     Domain:      {domain_str}", "highlight")
+            w.insert("end", f" (via {via})\n", "dim")
+        else:
+            w.insert("end", f"  │     Domain:      {domain_str}\n")
+        all_doms = c.get('all_domains', [])
+        if all_doms and len(all_doms) > 1:
+            w.insert("end", f"  │     All Domains: {', '.join(all_doms[:8])}", "dim")
+            if len(all_doms) > 8:
+                w.insert("end", f" (+{len(all_doms)-8} more)", "dim")
+            w.insert("end", "\n")
+        elif all_doms and len(all_doms) == 1:
+            w.insert("end", f"  │     All Domains: {all_doms[0]}\n", "dim")
+        # === Geo detail ===
+        w.insert("end", f"  │     Country:     {c.get('country', '?')} ({c.get('country_code', '?')})\n")
+        w.insert("end", f"  │     City:        {c.get('city', '?')}\n")
+        w.insert("end", f"  │     Org:         {c.get('org', '?')}\n")
+        if risk > 0:
+            w.insert("end", f"  │     Risk:        {risk:.1f}\n", risk_tag)
+        # Location verification proof
+        loc_conf = c.get('loc_confidence', 0)
+        loc_grade = c.get('loc_grade', 'UNVERIFIED')
+        loc_proof = c.get('loc_proof', [])
+        if loc_proof:
+            grade_tag = "info" if loc_grade == "HIGH" else (
+                "warning" if loc_grade in ("MEDIUM", "LOW") else "critical")
+            w.insert("end", f"  │     📍 Location: ", "")
+            w.insert("end", f"{loc_conf}% {loc_grade}\n", grade_tag)
+            for proof in loc_proof:
+                w.insert("end", f"  │       {proof}\n", "dim")
+        # Proxy detection
+        proxy_type = c.get('proxy_type', '')
+        if proxy_type:
+            proxy_detail = c.get('proxy_detail', '')
+            w.insert("end", f"  │     🔀 Proxy:    ", "")
+            w.insert("end", f"{proxy_type}\n", "warning")
+            if proxy_detail:
+                w.insert("end", f"  │       {proxy_detail}\n", "dim")
+
     def _refresh_live(self, data):
-        """Show ONLY live (active/established) connections — drops vanish instantly."""
+        """Show ONLY live (active/established) connections with collapsible rows."""
+        self._last_live_data = data
         w = self._live_text
         at_bottom, frac = self._begin_refresh(w)
         # Destroy old embedded buttons
@@ -4476,21 +5005,38 @@ class GNATracerGUI:
         w.config(state="normal")
         w.delete("1.0", "end")
         conns = data.get('connections', [])
-        # Filter to only ESTABLISHED / SYN_SENT / SYN_RECV (truly live)
-        live_statuses = {'ESTABLISHED', 'SYN_SENT', 'SYN_RECV', 'LISTEN', 'LAST_ACK', 'FIN_WAIT1', 'FIN_WAIT2'}
+        live_statuses = {'ESTABLISHED', 'SYN_SENT', 'SYN_RECV', 'LISTEN', 'LAST_ACK', 'FIN_WAIT1', 'FIN_WAIT2', 'CLOSE_WAIT', 'TIME_WAIT'}
         live = [c for c in conns if c.get('status', '').upper() in live_statuses]
         # Apply search filter
         search_q = self._search_live.get()
         if search_q and len(search_q) >= 2:
             live = [c for c in live if self._conn_matches_search(c, search_q)]
+        # Header with Expand All / Collapse All buttons
         w.insert("end", f"{'═' * 140}\n", "dim")
-        w.insert("end", f"  🟢 LIVE CONNECTIONS — {len(live)} active right now", "header")
+        w.insert("end", f"  🟢 LIVE CONNECTIONS — {len(live)} active  ", "header")
+        # Expand All button
+        btn_expand = tk.Button(
+            w, text="▼ Expand All", bg="#333355", fg="#00d4ff",
+            font=("Consolas", 8, "bold"), bd=0, padx=6, pady=0,
+            activebackground="#555577", activeforeground="#ffffff",
+            command=lambda: self._live_set_all_expanded(True))
+        w.window_create("end", window=btn_expand)
+        self._live_buttons.append(btn_expand)
+        w.insert("end", "  ")
+        # Collapse All button
+        btn_collapse = tk.Button(
+            w, text="▶ Collapse All", bg="#333355", fg="#aaaaaa",
+            font=("Consolas", 8, "bold"), bd=0, padx=6, pady=0,
+            activebackground="#555577", activeforeground="#ffffff",
+            command=lambda: self._live_set_all_expanded(False))
+        w.window_create("end", window=btn_collapse)
+        self._live_buttons.append(btn_collapse)
         if search_q and len(search_q) >= 2:
             w.insert("end", f"  (filter: \"{search_q}\")", "dim")
         w.insert("end", "\n")
-        w.insert("end", f"{'═' * 140}\n\n", "dim")
+        w.insert("end", f"{'═' * 140}\n", "dim")
         if not live:
-            w.insert("end", "  No live connections" +
+            w.insert("end", "\n  No live connections" +
                      (f" matching \"{search_q}\"" if search_q else "") + ".\n", "dim")
         else:
             by_cat = defaultdict(list)
@@ -4498,10 +5044,25 @@ class GNATracerGUI:
                 by_cat[c.get('category', 'Unknown')].append(c)
             for cat in sorted(by_cat.keys()):
                 cat_conns = by_cat[cat]
-                w.insert("end", f"\n  ┌─ {cat} ({len(cat_conns)} live) ", "subheader")
-                w.insert("end", "─" * 80 + "\n", "dim")
+                cat_keys = [self._live_conn_key(c) for c in cat_conns]
+                # Category header with toggle button
+                w.insert("end", "\n  ")
+                cat_any_open = any(self._live_expanded.get(k, False) for k in cat_keys)
+                cat_arrow = "▼" if cat_any_open else "▶"
+                cat_btn = tk.Button(
+                    w, text=f"{cat_arrow} {cat} ({len(cat_conns)})",
+                    bg="#1a1a2e", fg="#00d4ff",
+                    font=("Consolas", 9, "bold"), bd=0, padx=4, pady=1,
+                    activebackground="#333355", activeforeground="#ffffff",
+                    anchor="w",
+                    command=lambda ck=cat_keys: self._live_toggle_category(cat, ck))
+                w.window_create("end", window=cat_btn)
+                self._live_buttons.append(cat_btn)
+                w.insert("end", " " + "─" * 80 + "\n", "dim")
                 for idx, c in enumerate(cat_conns, 1):
                     rip = c.get('remote_ip', '')
+                    conn_key = self._live_conn_key(c)
+                    is_expanded = self._live_expanded.get(conn_key, False)
                     is_blocked = rip in self._blocked_ips
                     risk = 0
                     for p in data.get('processes', []):
@@ -4514,54 +5075,41 @@ class GNATracerGUI:
                         risk_tag = "warning"
                     else:
                         risk_tag = "info"
-                    w.insert("end", f"  │\n")
-                    w.insert("end", f"  ├── [{idx}] ", "highlight")
-                    w.insert("end", f"{c.get('icon', '?')} {c.get('service', 'Unknown')}  ", "highlight")
-                    # Block button
-                    if rip:
-                        btn_text = f"🔓 Unblock {rip}" if is_blocked else f"🚫 Block {rip}"
-                        btn_bg = "#4caf50" if is_blocked else "#8b0000"
-                        btn = tk.Button(
-                            w, text=btn_text, bg=btn_bg, fg="#ffffff",
-                            font=("Consolas", 8, "bold"), bd=0, padx=6, pady=0,
-                            activebackground="#555555", activeforeground="#ffffff",
-                            command=lambda ip=rip, ci=c: self._toggle_block_ip(ip, ci))
-                        w.window_create("end", window=btn)
-                        self._live_buttons.append(btn)
+                    # --- Compact summary row with toggle arrow ---
+                    arrow = "▼" if is_expanded else "▶"
+                    wtag = c.get('website_tag', '')
+                    svc_label = wtag if wtag else c.get('service', 'Unknown')
+                    summary = f"{c.get('icon', '?')} {svc_label}  —  {rip}:{c.get('remote_port', '?')}  [{c.get('process', '?')}]"
                     if is_blocked:
-                        w.insert("end", "  ← BLOCKED", "critical")
-                    w.insert("end", "\n")
-                    w.insert("end", f"  │     Process:     {c.get('process', '?')} (PID {c.get('pid', '?')})\n")
-                    w.insert("end", f"  │     Remote:      {rip}:{c.get('remote_port', '?')}\n")
-                    w.insert("end", f"  │     Local Port:  {c.get('local_port', '?')}\n")
-                    w.insert("end", f"  │     Protocol:    {c.get('protocol', '?')} — Status: ", "")
-                    w.insert("end", f"{c.get('status', '?')}\n", risk_tag)
-                    w.insert("end", f"  │     Domain:      {c.get('domain', 'unresolved')}\n")
-                    w.insert("end", f"  │     Country:     {c.get('country', '?')} ({c.get('country_code', '?')})\n")
-                    w.insert("end", f"  │     City:        {c.get('city', '?')}\n")
-                    w.insert("end", f"  │     Org:         {c.get('org', '?')}\n")
-                    if risk > 0:
-                        w.insert("end", f"  │     Risk:        {risk:.1f}\n", risk_tag)
-                    # Location verification proof
-                    loc_conf = c.get('loc_confidence', 0)
-                    loc_grade = c.get('loc_grade', 'UNVERIFIED')
-                    loc_proof = c.get('loc_proof', [])
-                    if loc_proof:
-                        grade_tag = "info" if loc_grade == "HIGH" else (
-                            "warning" if loc_grade in ("MEDIUM", "LOW") else "critical")
-                        w.insert("end", f"  │     📍 Location: ", "")
-                        w.insert("end", f"{loc_conf}% {loc_grade}\n", grade_tag)
-                        for proof in loc_proof:
-                            w.insert("end", f"  │       {proof}\n", "dim")
-                    # Proxy detection
-                    proxy_type = c.get('proxy_type', '')
-                    if proxy_type:
-                        proxy_detail = c.get('proxy_detail', '')
-                        w.insert("end", f"  │     🔀 Proxy:    ", "")
-                        w.insert("end", f"{proxy_type}\n", "warning")
-                        if proxy_detail:
-                            w.insert("end", f"  │       {proxy_detail}\n", "dim")
-                w.insert("end", f"  └{'─' * 100}\n", "dim")
+                        summary += "  🚫BLOCKED"
+                    w.insert("end", f"  ")
+                    # Toggle button
+                    toggle_btn = tk.Button(
+                        w, text=arrow, bg="#12121a", fg="#00d4ff",
+                        font=("Consolas", 10, "bold"), bd=0, padx=2, pady=0,
+                        activebackground="#333355", activeforeground="#ffffff",
+                        command=lambda ck=conn_key: self._live_toggle_conn(ck))
+                    w.window_create("end", window=toggle_btn)
+                    self._live_buttons.append(toggle_btn)
+                    w.insert("end", f" ", "")
+                    w.insert("end", f"{summary}\n", "highlight" if is_expanded else "")
+                    # --- Expanded detail ---
+                    if is_expanded:
+                        # Block button inside expanded view
+                        if rip:
+                            btn_text = f"🔓 Unblock {rip}" if is_blocked else f"🚫 Block {rip}"
+                            btn_bg = "#4caf50" if is_blocked else "#8b0000"
+                            btn = tk.Button(
+                                w, text=btn_text, bg=btn_bg, fg="#ffffff",
+                                font=("Consolas", 8, "bold"), bd=0, padx=6, pady=0,
+                                activebackground="#555555", activeforeground="#ffffff",
+                                command=lambda ip=rip, ci=c: self._toggle_block_ip(ip, ci))
+                            w.insert("end", "       ")
+                            w.window_create("end", window=btn)
+                            self._live_buttons.append(btn)
+                            w.insert("end", "\n")
+                        self._live_render_detail(w, c, risk, risk_tag)
+                        w.insert("end", f"  └{'─' * 90}\n", "dim")
         self._highlight_search(w, search_q)
         w.config(state="disabled")
         self._end_refresh(w, at_bottom, frac)
@@ -4624,11 +5172,40 @@ class GNATracerGUI:
                     if is_blocked:
                         w.insert("end", "  ← BLOCKED", "critical")
                     w.insert("end", "\n")
+                    # === WEBSITE TAG ===
+                    wtag = c.get('website_tag', '')
+                    if wtag:
+                        w.insert("end", f"  │  🏷️ WEBSITE:    ", "")
+                        w.insert("end", f"{wtag}\n", "highlight")
+                    # === Process detail ===
                     w.insert("end", f"  │     Process:     {c.get('process', '?')} (PID {c.get('pid', '?')})\n")
+                    exe_path = c.get('exe_path', '')
+                    if exe_path:
+                        w.insert("end", f"  │     Exe Path:    {exe_path}\n", "dim")
+                    parent = c.get('parent_name', '')
+                    if parent:
+                        w.insert("end", f"  │     Parent:      {parent}\n", "dim")
+                    # === Network detail ===
                     w.insert("end", f"  │     Remote:      {rip}:{c.get('remote_port', '?')}\n")
                     w.insert("end", f"  │     Local Port:  {c.get('local_port', '?')}\n")
                     w.insert("end", f"  │     Protocol:    {c.get('protocol', '?')} — Status: {c.get('status', '?')}\n")
-                    w.insert("end", f"  │     Domain:      {c.get('domain', 'unresolved')}\n")
+                    # === Domain detail ===
+                    domain_str = c.get('domain', 'unresolved')
+                    via = c.get('via', '')
+                    if via:
+                        w.insert("end", f"  │     Domain:      {domain_str}", "highlight")
+                        w.insert("end", f" (via {via})\n", "dim")
+                    else:
+                        w.insert("end", f"  │     Domain:      {domain_str}\n")
+                    all_doms = c.get('all_domains', [])
+                    if all_doms and len(all_doms) > 1:
+                        w.insert("end", f"  │     All Domains: {', '.join(all_doms[:8])}", "dim")
+                        if len(all_doms) > 8:
+                            w.insert("end", f" (+{len(all_doms)-8} more)", "dim")
+                        w.insert("end", "\n")
+                    elif all_doms and len(all_doms) == 1:
+                        w.insert("end", f"  │     All Domains: {all_doms[0]}\n", "dim")
+                    # === Geo detail ===
                     w.insert("end", f"  │     Country:     {c.get('country', '?')} ({c.get('country_code', '?')})\n")
                     w.insert("end", f"  │     City:        {c.get('city', '?')}, Region: {c.get('region', '?')}\n")
                     w.insert("end", f"  │     Org:         {c.get('org', '?')}\n")
@@ -5928,6 +6505,7 @@ class MedianBoxMonitor:
 
         # Deductive Chess Engine v2
         self.dns_cache = DNSCache()
+        self.dns_cache.load_history()
         self.beacon_detector = BeaconDetector()
         self.process_profiles: dict[int, ProcessProfile] = {}
         self.process_actions = defaultdict(list)
@@ -6888,6 +7466,25 @@ class MedianBoxMonitor:
                 _logger.debug("ARP scan error: %s", exc)
             time.sleep(random.uniform(CONFIG['scan_interval_min'], CONFIG['scan_interval_max']))
 
+    def _dns_cache_poll_thread(self):
+        """Periodically poll Windows DNS client cache and save domain history."""
+        # Initial aggressive poll on startup
+        self.dns_cache.poll_system_dns_cache()
+        save_counter = 0
+        while not self.stop.is_set():
+            time.sleep(15)
+            try:
+                self.dns_cache.poll_system_dns_cache()
+            except Exception as exc:
+                _logger.debug("DNS poll thread error: %s", exc)
+            save_counter += 1
+            if save_counter >= 4:  # Save every ~60 seconds
+                try:
+                    self.dns_cache.save_history()
+                except Exception as exc:
+                    _logger.debug("DNS history save error: %s", exc)
+                save_counter = 0
+
     def _sniff_thread(self):
         filt = "ip or ip6 or arp"
         while not self.stop.is_set():
@@ -7199,6 +7796,8 @@ class MedianBoxMonitor:
         else:
             self._log(f"{Colors.Y}Skipping packet capture (no admin). Process monitoring only.{Colors.END}")
 
+        threads.append(threading.Thread(target=self._dns_cache_poll_thread,
+                                        daemon=True, name="DNS-Cache-Poll"))
         if _IS_WINDOWS:
             threads.append(threading.Thread(target=self._memory_forensics_thread,
                                             daemon=True, name="Memory-Forensics"))
