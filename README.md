@@ -1,5 +1,7 @@
 # MedianBoxMonitor 3.0
 
+by using the block feature, a person can reduce deduce where sites are located by blocking IP, to then double verify such as by blocking jagex, playing OSRS doesnt work any more. this is a verification
+
 **A local, defensive security monitoring application that watches every process, every connection, and every system event on your machine in real time — and shows its work.**
 
 Single-file Python application (~17,150 lines). Windows-primary, Linux-partial. No offensive capability, no remote scanning, no phoning home.
