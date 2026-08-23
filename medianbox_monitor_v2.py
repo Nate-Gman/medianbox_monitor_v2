@@ -7311,10 +7311,18 @@ class GNATracerGUI:
         self._tooltip = None
         self._tooltip_id = None
         self._selected_ip = None
-        # Zoom / pan state for real tile map (Web Mercator)
-        self._map_zoom = 2.0          # fractional zoom (integer part = OSM tile level)
-        self._map_center_lat = 20.0   # initial center latitude
-        self._map_center_lon = 0.0    # initial center longitude
+        # Zoom / pan state for real tile map (Web Mercator).
+        # Default zoom raised from 2.0 to 3.0 (50% more, per request) — the
+        # old default plus a center point unrelated to the user (20°N, 0°E,
+        # mid-Atlantic) meant the very first view of the map was a huge,
+        # mostly-empty world view. Once the user's own GeoIP resolves, the
+        # first map refresh re-centers on it (see _refresh_map) — this is
+        # just the fallback for before that lookup completes, or when GeoIP
+        # is disabled.
+        self._map_zoom = 3.0          # fractional zoom (integer part = OSM tile level)
+        self._map_center_lat = 20.0   # initial center latitude (until auto-centered)
+        self._map_center_lon = 0.0    # initial center longitude (until auto-centered)
+        self._map_auto_centered = False  # True once centered on the user's own location
         self._map_drag_start = None   # (x, y) when drag starts
         self._map_left_drag_start = None  # for left-button panning
         self._map_left_pan_offset = (0, 0)
@@ -7852,6 +7860,13 @@ class GNATracerGUI:
         """Redraw the entire map: real OSM tiles (if PIL available) or fallback grid+coastline."""
         if not self._map_canvas:
             return
+        # Record the view this draw was made for, so the periodic refresh in
+        # _refresh_map can skip re-issuing this (expensive) full redraw when
+        # nothing has actually moved — regardless of whether this call came
+        # from that periodic refresh or directly from a zoom/pan/preset button.
+        self._map_last_view_state = (
+            round(self._map_zoom, 3), round(self._map_center_lat, 4),
+            round(self._map_center_lon, 4), self._map_w, self._map_h)
         self._map_canvas.delete("grid", "coastline", "label", "city", "tile", "scalebar", "loading", "attribution")
         self._map_tile_images = []  # clear PhotoImage refs
         if self._map_use_tiles:
@@ -7935,8 +7950,10 @@ class GNATracerGUI:
                     else:
                         TileManager.get_tile(z_int, tx, ty)
                         tiles_pending += 1
-        # Draw grid overlay on top of tiles
-        self._draw_grid_overlay()
+        # Coordinate grid overlay removed — the OSM tiles already carry
+        # borders/coastlines/city names, and the dotted lat/lon mesh plus its
+        # per-line degree labels were pure clutter competing with the actual
+        # map content (and with the connection dots/labels drawn on top).
         # Draw scale bar
         self._draw_scale_bar()
         # Draw attribution
@@ -8070,7 +8087,7 @@ class GNATracerGUI:
                 self._map_canvas.create_line(
                     x1, y, x2, y, fill="#1a3a3a", width=1,
                     tags="grid", dash=(2, 6), stipple="gray50")
-                if z >= 2:
+                if z >= 7:
                     self._map_canvas.create_text(
                         4, y - 2, text=f"{lat:.2f}°", fill="#448888",
                         font=("Consolas", 7), anchor="sw", tags="grid")
@@ -8086,7 +8103,7 @@ class GNATracerGUI:
                 self._map_canvas.create_line(
                     x, y1, x, y2, fill="#1a3a3a", width=1,
                     tags="grid", dash=(2, 6), stipple="gray50")
-                if z >= 2:
+                if z >= 7:
                     self._map_canvas.create_text(
                         x + 2, h - 2, text=f"{lon:.2f}°", fill="#448888",
                         font=("Consolas", 7), anchor="se", tags="grid")
@@ -8464,10 +8481,17 @@ class GNATracerGUI:
         self._redraw_dots_only()
 
     def _map_reset_view(self):
-        """Reset map to default view."""
-        self._map_zoom = 2.0
-        self._map_center_lat = 20.0
-        self._map_center_lon = 0.0
+        """Reset map to the default view — centered on the user's own
+        location (same as the initial auto-center) when it's known, rather
+        than the generic mid-Atlantic point, at the default zoom."""
+        self._map_zoom = 3.0
+        local_geo = (self._last_full_data or {}).get('local_geo', {})
+        if local_geo.get('lat') or local_geo.get('lon'):
+            self._map_center_lat = max(-85, min(85, local_geo.get('lat', 0)))
+            self._map_center_lon = max(-180, min(180, local_geo.get('lon', 0)))
+        else:
+            self._map_center_lat = 20.0
+            self._map_center_lon = 0.0
         if hasattr(self, '_map_zoom_slider'):
             self._map_zoom_slider.set(self._map_zoom)
         TileManager.clear_photo_cache()
@@ -9121,8 +9145,8 @@ class GNATracerGUI:
                   command=self._map_reset_view)
         btn_home.pack(side="left", padx=2, pady=3)
         _add_tooltip(btn_home,
-            "Reset view\n─────────────────────\nReset map to default zoom (2.0)\n"
-            "and center on world view.")
+            "Reset view\n─────────────────────\nReset map to default zoom (3.0),\n"
+            "centered on your own location when known.")
         # Zoom slider
         tk.Label(map_ctrl, text="Zoom:", bg="#1a1a2e", fg="#a0a0b0",
                  font=("Consolas", 8)).pack(side="left", padx=(6, 2))
@@ -11109,15 +11133,35 @@ class GNATracerGUI:
                                           or rep.get('vpn_score', 0) >= 30):
                 ip_vpn[ip_str] = rep
         # Cache for zoom/pan redraws
+        local_geo = data.get('local_geo', {})
         self._last_map_data = {
             'all_points': all_points,
             'ip_risk': ip_risk,
             'ip_conn_count': ip_conn_count,
             'ip_vpn': ip_vpn,
-            'local_geo': data.get('local_geo', {}),
+            'local_geo': local_geo,
         }
-        # Full redraw: tiles + grid + dots + trace path
-        self._draw_map_full()
+        # First time the user's own GeoIP resolves (it's an async lookup, not
+        # available on the very first refresh), re-center the default view on
+        # it instead of the generic mid-Atlantic (20°N, 0°E) point — "closer
+        # to location" means centered on the actual user, not just a bigger
+        # zoom number on an arbitrary spot. Only happens once per session so
+        # it never fights the user's own panning/zooming afterward.
+        if not self._map_auto_centered and (local_geo.get('lat') or local_geo.get('lon')):
+            self._map_center_lat = max(-85, min(85, local_geo.get('lat', 0)))
+            self._map_center_lon = max(-180, min(180, local_geo.get('lon', 0)))
+            self._map_auto_centered = True
+        # Full redraw (tiles) only when the view actually moved. This runs on
+        # every GUI refresh cycle while the Map tab is active — tearing down
+        # and recreating every tile image several times a second regardless
+        # of whether the view had changed was the main source of map lag.
+        # Panning/zooming/preset buttons call _draw_map_full() directly too
+        # (for instant feedback) and update the same state, so this only
+        # skips the *redundant* rebuilds, never a real one.
+        view_state = (round(self._map_zoom, 3), round(self._map_center_lat, 4),
+                     round(self._map_center_lon, 4), self._map_w, self._map_h)
+        if view_state != getattr(self, '_map_last_view_state', None):
+            self._draw_map_full()
         self._map_canvas.delete("dot", "line_to_dot", "trace_path", "trace_hop", "crosshair")
         self._plot_map_dots(self._last_map_data)
         self._plot_trace_on_map()
@@ -11150,14 +11194,15 @@ class GNATracerGUI:
             self._map_canvas.create_oval(
                 local_x - 7, local_y - 7, local_x + 7, local_y + 7,
                 fill="#00d4ff", outline="#ffffff", width=2, tags="dot")
-            # Label
+            # Label — always shown (it's one marker, not clutter-prone), but
+            # still scales gently with zoom rather than a fixed size.
             loc_str = f"{local_geo.get('city', '?')}, {local_geo.get('country_code', '?')}"
-            self._map_canvas.create_text(
-                local_x + 14, local_y - 8, text="📍 YOU",
-                fill="#00d4ff", font=("Consolas", 9, "bold"), anchor="w", tags="dot")
-            self._map_canvas.create_text(
-                local_x + 14, local_y + 4, text=loc_str,
-                fill="#88ccff", font=("Consolas", 7), anchor="w", tags="dot")
+            you_sz = self._map_label_size(z, max_size=15, floor=10, z_min=0)
+            city_sz = self._map_label_size(z, max_size=13, floor=9, z_min=0)
+            self._map_chip_label(local_x + 18, local_y - you_sz, "📍 YOU",
+                                 "#33e0ff", you_sz, anchor="w")
+            self._map_chip_label(local_x + 18, local_y + city_sz, loc_str,
+                                 "#aaddff", city_sz, anchor="w")
         # Draw connection lines from local to remote
         if z >= 2 and all_points and has_local:
             for pt in all_points:
@@ -11195,8 +11240,37 @@ class GNATracerGUI:
                         local_x, local_y, x, y,
                         fill="#1a2a4a", width=1, dash=(3, 6),
                         tags="line_to_dot")
-        # Decluster: detect overlapping points and apply slight jitter
-        occupied: dict = {}  # (round(x,1), round(y,1)) -> count
+        # Decluster: detect overlapping points and apply slight jitter.
+        #
+        # Many public IPs resolve to the exact same city-level lat/lon (GeoIP
+        # is city-granularity, not per-host), so a handful of parallel
+        # connections routinely lands a dozen+ points on the same pixel. The
+        # old code jittered each one a few pixels apart and then drew a full
+        # text label (IP address, and a second VPN-disclaimer line) next to
+        # EVERY one of them — with only ~4-20px of spiral offset between
+        # labels that are each 50-150px wide, they stack into an unreadable
+        # smear (this is what made the map "unreadable" — not font size).
+        #
+        # Fix: label individual dots only in small, uncluttered groups.
+        # Clusters of 3+ get exactly one compact "×N" badge instead of N
+        # overlapping labels — full per-connection detail is still one hover
+        # away via the existing tooltip.
+        cluster_key_of: dict = {}   # id(pt) -> cluster key
+        cluster_size: dict = {}     # cluster key -> point count
+        cluster_anchor: dict = {}   # cluster key -> (x, y) of first point
+        for pt in all_points:
+            lat, lon = pt.get('lat', 0), pt.get('lon', 0)
+            if lat == 0 and lon == 0:
+                continue
+            x, y = self._latlon_to_xy(lat, lon)
+            if x < -20 or x > w + 20 or y < -20 or y > h + 20:
+                continue
+            key = (round(x, 1), round(y, 1))
+            cluster_key_of[id(pt)] = key
+            cluster_size[key] = cluster_size.get(key, 0) + 1
+            cluster_anchor.setdefault(key, (x, y))
+        occupied: dict = {}  # (round(x,1), round(y,1)) -> count placed so far
+        cluster_labeled: set = set()  # clusters that already got their one badge
         for pt in all_points:
             lat, lon = pt.get('lat', 0), pt.get('lon', 0)
             if lat == 0 and lon == 0:
@@ -11205,9 +11279,8 @@ class GNATracerGUI:
             # Skip dots outside viewport
             if x < -20 or x > w + 20 or y < -20 or y > h + 20:
                 continue
-            # Declustering: if another dot is at the same rounded position,
-            # apply a spiral jitter
-            key = (round(x, 1), round(y, 1))
+            key = cluster_key_of.get(id(pt), (round(x, 1), round(y, 1)))
+            cluster_n = cluster_size.get(key, 1)
             count = occupied.get(key, 0)
             if count > 0:
                 # Spiral jitter: place overlapping dots in a small spiral
@@ -11257,22 +11330,76 @@ class GNATracerGUI:
                 lambda e, i=ip: self._on_map_dot_click(i))
             self._map_canvas.tag_bind(dot, "<Button-3>",
                 lambda e, i=ip, inf=info: self._on_map_dot_right_click(e, i, inf))
-            # Show IP label when zoomed in enough
-            if z >= 4:
-                self._map_canvas.create_text(
-                    x + radius + 3, y, text=ip, fill="#ffcc00",
-                    font=("Consolas", max(7, min(9, int(6 + z * 0.3))), "bold"),
-                    anchor="w", tags="dot")
-            # VPN/proxy disclaimer label — marks this as an EXIT NODE, not
-            # the real source location. Shown when zoomed in enough.
-            if vpn_rep and z >= 3:
-                prov = vpn_rep.get('provider') or ''
-                disclaimer = (f"⚠ {prov} EXIT (not real source)" if prov
-                              else "⚠ VPN EXIT (not real source)")
-                self._map_canvas.create_text(
-                    x, y - radius - 8, text=disclaimer, fill="#ff66ff",
-                    font=("Consolas", max(6, min(8, int(5 + z * 0.25))), "bold"),
-                    anchor="center", tags="dot")
+            # Per-dot text labels — only for a true singleton (nothing else
+            # shares its cell). Anything with company gets the one compact
+            # badge below instead of stacked, unreadable labels. Every label
+            # gets an opaque dark chip behind it (via _map_chip_label) —
+            # colored text floating directly on light OSM tile colors (the
+            # default "OSM Standard" style is mostly pale beige/white) had
+            # poor contrast regardless of which text color was chosen; a
+            # solid backing fixes that at any zoom or tile style.
+            #
+            # Size scales continuously with zoom (_map_label_size) instead of
+            # a hard z>=5 on/off gate — the gate made a label pop in at full
+            # (oversized) size the instant zoom crossed 5, then vanish
+            # completely one notch below it. Growing smoothly from a small
+            # floor means there's no jump, and nothing needed only to
+            # disappear again on a small zoom-out.
+            uncluttered = cluster_n == 1
+            if uncluttered:
+                fsz = self._map_label_size(z, max_size=21)
+                if fsz:
+                    self._map_chip_label(x + radius + 8, y, ip, "#ffe066",
+                                         fsz, anchor="w")
+            # VPN/proxy disclaimer — only on isolated dots; a clustered VPN
+            # exit is already unambiguous from its magenta color plus the
+            # legend, and the full warning is always one hover away.
+            if vpn_rep and uncluttered:
+                fsz = self._map_label_size(z, max_size=18)
+                if fsz:
+                    prov = vpn_rep.get('provider') or ''
+                    disclaimer = f"⚠ {prov} EXIT" if prov else "⚠ VPN EXIT"
+                    self._map_chip_label(x, y - radius - (fsz + 6), disclaimer,
+                                         "#ff99ff", fsz)
+            # Cluster badge — one compact "×N" marker per shared cell,
+            # replacing what used to be N stacked, overlapping labels. Always
+            # shown (no zoom gate) since it's already compact, but still
+            # scales gently so it doesn't dominate a zoomed-out view.
+            if cluster_n >= 2 and key not in cluster_labeled:
+                cluster_labeled.add(key)
+                fsz = self._map_label_size(z, max_size=18, floor=10, z_min=0)
+                ax, ay = cluster_anchor.get(key, (x, y))
+                self._map_chip_label(ax + radius + fsz + 4, ay - radius - fsz,
+                                     f"×{cluster_n}", "#ffe066", fsz)
+
+    @staticmethod
+    def _map_label_size(z, max_size, floor=8, z_min=3.0, z_full=7.5):
+        """Continuous label font size for the map: grows smoothly from
+        `floor` at `z_min` up to `max_size` at `z_full`, instead of a fixed
+        size that pops in past a hard zoom threshold. Returns 0 (meaning
+        "don't draw it") below z_min."""
+        if z < z_min:
+            return 0
+        t = 1.0 if z_full <= z_min else max(0.0, min(1.0, (z - z_min) / (z_full - z_min)))
+        return max(floor, round(floor + t * (max_size - floor)))
+
+    def _map_chip_label(self, cx, cy, text, fg, font_size, anchor="center"):
+        """Draw text on an opaque dark chip, sized to fit — used for every
+        map label so text stays legible over light and dark tile colors
+        alike, at any zoom, rather than floating directly on the tiles."""
+        t = self._map_canvas.create_text(
+            cx, cy, text=text, fill=fg,
+            font=("Consolas", font_size, "bold"), anchor=anchor, tags="dot")
+        bb = self._map_canvas.bbox(t)
+        if not bb:
+            return t
+        pad_x = max(4, font_size // 3)
+        pad_y = max(3, font_size // 5)
+        bg = self._map_canvas.create_rectangle(
+            bb[0] - pad_x, bb[1] - pad_y, bb[2] + pad_x, bb[3] + pad_y,
+            fill="#050508", outline=fg, width=2, tags="dot")
+        self._map_canvas.tag_raise(t, bg)
+        return t
 
     def _refresh_actions(self, data):
         w = self._actions_text
