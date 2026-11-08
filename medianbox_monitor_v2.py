@@ -5875,14 +5875,17 @@ class SpectrumHub:
             self.registry.mark_scan('rf-hw', seen)
         return res
 
-    def _process_wire(self, talkers):
+    def _process_wire(self, talkers, lan_devices=None):
         """Flush the sniffer's per-MAC census into the emitter registry.
 
         Every source MAC seen on the wire becomes a traced 'l2-wire'
         emitter labelled with the ethertypes it speaks, the L3 identities
         it claims (src/ARP/ND), the discovery services it announces, and
         derived roles (ipv6-router, discovery-announcer, raw-ethertype-
-        channel, never-speaks-ip…). Stale rows are pruned back into the
+        channel, never-speaks-ip…). When the monitor's LAN-device table
+        is passed in, matching emitters pick up the device record's
+        hostname/OS-guess/open-ports/JA4 — the wire talker becomes a
+        named, fingerprinted device. Stale rows are pruned back into the
         caller's table; quiet emitters get absent-marked per scan rules.
         """
         now = time.time()
@@ -5892,6 +5895,19 @@ class SpectrumHub:
         svcs: set = set()
         active_horizon = float(CONFIG.get('rf_l2_active_s', 120))
         drop_after = float(CONFIG.get('rf_l2_drop_s', 3600))
+        dev_by_mac = {}
+        if lan_devices:
+            for dv in lan_devices.values():
+                if isinstance(dv, dict) and dv.get('mac'):
+                    dev_by_mac.setdefault(_norm_mac(dv['mac']), dv)
+        own_macs = set()
+        for it in (self._results.get('ifaces', {}) or {}) \
+                .get('interfaces', []):
+            if it.get('mac'):
+                own_macs.add(_norm_mac(it['mac']))
+        for r in (self._results.get('wifi', {}) or {}).get('radios', []):
+            if r.get('physical address'):
+                own_macs.add(_norm_mac(r['physical address']))
         try:
             items = list(talkers.items())
         except Exception:
@@ -5936,6 +5952,13 @@ class SpectrumHub:
                 roles.append('gateway/forwarder')
             if ets and not speaks_ip and 0x0806 not in ets:
                 roles.append('never-speaks-ip')
+            dv = dev_by_mac.get(_norm_mac(mac))
+            if _norm_mac(mac) in own_macs:
+                roles.append('this-host')
+            if dv:
+                if dv.get('open_ports'):
+                    roles.append(f"service-host:{len(dv['open_ports'])}ports")
+                roles.append('lan-device')
             if not roles:
                 roles.append('ip-endpoint' if speaks_ip else 'l2-only')
             roles_seen.update(roles)
@@ -5944,6 +5967,7 @@ class SpectrumHub:
             key = f"l2-wire:{_norm_mac(mac)}"
             em, created = self.registry.observe(
                 'l2-wire', mac, sensor='wire',
+                name=(dv or {}).get('hostname') or '',
                 extra={
                     'ethertypes_spoken': et_names,
                     'claimed_ips': sorted(rec.get('ips') or [])[:16],
@@ -5954,6 +5978,11 @@ class SpectrumHub:
                     'non_ip_ethertypes': [f"0x{e:04x}"
                                           for e in sorted(nonip_ets)],
                     'forwarded_public_srcs': rec.get('fwd', 0),
+                    'device_hostname': (dv or {}).get('hostname'),
+                    'device_os_guess': (dv or {}).get('os_guess'),
+                    'device_open_ports': (dv or {}).get('open_ports'),
+                    'device_ja4': (dv or {}).get('ja4'),
+                    'device_confidence': (dv or {}).get('confidence'),
                     'first_frame': _fmt_ts(rec.get('first')),
                     'last_frame': _fmt_ts(last),
                 })
@@ -6065,13 +6094,14 @@ class SpectrumHub:
                 self._fixes[key] = fix
 
     # -- main tick ----------------------------------------------------------------
-    def tick(self, wire_talkers=None):
+    def tick(self, wire_talkers=None, lan_devices=None):
         if not self.enabled:
             return
         self._scan_cycle += 1
         if wire_talkers is not None and self._due(
                 'l2wire', 'rf_l2_flush_interval', 15):
-            self._results['l2wire'] = self._process_wire(wire_talkers)
+            self._results['l2wire'] = self._process_wire(
+                wire_talkers, lan_devices=lan_devices)
         if self._due('wifi', 'rf_wifi_interval', 15):
             self._results['wifi'] = self._process_wifi(self.wifi.scan())
         if self._due('bt', 'rf_bt_interval', 30):
@@ -23375,6 +23405,8 @@ class WidgetTooltip:
     def __init__(self, widget, text, delay_ms=400, bg="#1e1e30", fg="#c8c8e0",
                  font=("Consolas", 8), padx=8, pady=5, max_width=420):
         self.widget = widget
+        # `text` may be a callable — evaluated at show time so tooltips on
+        # live/changing labels never go stale.
         self._text = text
         self._delay_ms = delay_ms
         self._bg = bg
@@ -23385,6 +23417,12 @@ class WidgetTooltip:
         self._max_width = max_width
         self._tip_window = None
         self._after_id = None
+        # Mark so the class-level label-tooltip fallback skips widgets that
+        # already carry an explicit description.
+        try:
+            widget._gna_has_tip = True
+        except Exception:
+            pass
         # Bind events
         self.widget.bind("<Enter>", self._on_enter, add="+")
         self.widget.bind("<Leave>", self._on_leave, add="+")
@@ -23419,10 +23457,14 @@ class WidgetTooltip:
 
     def _show(self, x, y):
         self._hide()
-        if not self._text:
+        text = self._text() if callable(self._text) else self._text
+        if not text:
             return
         try:
             self._tip_window = tk.Toplevel(self.widget)
+            # Mark the popup so the label-tooltip fallback never tries to
+            # describe a label inside a tooltip itself.
+            self._tip_window._gna_is_tip = True
             self._tip_window.wm_overrideredirect(True)
             # Keep tooltip on screen
             screen_w = self.widget.winfo_screenwidth()
@@ -23436,7 +23478,7 @@ class WidgetTooltip:
             frame = tk.Frame(self._tip_window, bg=self._bg, bd=1, relief="solid")
             frame.pack()
             # Support multi-line text
-            lines = self._text.split('\n') if isinstance(self._text, str) else self._text
+            lines = text.split('\n') if isinstance(text, str) else text
             for line in lines:
                 if isinstance(line, tuple):
                     txt, tag = line
@@ -23472,6 +23514,31 @@ class WidgetTooltip:
 def _add_tooltip(widget, text, delay_ms=400):
     """Convenience function to attach a tooltip to any widget."""
     return WidgetTooltip(widget, text, delay_ms=delay_ms)
+
+
+# Global scale for map pinpoints and their text labels — the connection
+# dots, hop markers, "YOU" pin and chip labels rendered ~25% oversized,
+# so every canvas-drawn marker goes through this factor.
+_MAP_MARKER_SCALE = 0.75
+
+# Descriptions for label texts the fallback hover handler can recognize —
+# keyed by normalized (whitespace-collapsed) label text. Anything not
+# listed still gets a tooltip showing the label's own text.
+_LABEL_DESCRIPTIONS = {
+    "🔍": "Search filter — type in the box to filter the rows below.",
+    "SENS": "Sensor strip — live counters from each detection engine.",
+    "FLOW": "Flow strip — live socket-state totals and interface throughput.",
+    "POSTURE": "Posture chips — one per security check; hover each for detail.",
+    "│": "Section divider between counter groups.",
+    "Zoom:": "Map zoom — buttons, slider, or mouse scroll on the map.",
+    "Style:": "Tile style — pick the map's artwork (OSM, terrain, topo…).",
+    "Go to:": "Fly-to search — place name or lat,lon, then Enter.",
+    "Presets:": "Camera presets — one-click jumps to saved map views.",
+    "Max hops:": "TTL ceiling for the trace — how many routers deep to go.",
+    "Auto (s):": "Auto-retrace interval in seconds (0 = off).",
+    "Rotate log at (KB):": "Start a new trace log file past this size.",
+    "GNA TRACER": "GNA Tracer — full network intelligence · deductive monitor.",
+}
 
 
 class GNATracerGUI:
@@ -23569,6 +23636,18 @@ class GNATracerGUI:
         self._map_search_var = None    # tk.StringVar for location search
         self._map_help_visible = False # keyboard help overlay toggle
         self._map_action_log_expanded = True  # action log panel state
+        # Pinpoint/geo sidebar — multi-toggle selection of every mapped
+        # point (IP pinpoints plus IP-less geo points: local marker, trace
+        # hops, trilateration fixes, RF sensors). key -> item dict.
+        self._map_sel: dict = {}
+        self._map_sel_last = None      # key of last-clicked row (detail pane)
+        self._map_sidebar = None       # outer sidebar frame
+        self._map_sidebar_canvas = None  # scroll host for the row list
+        self._map_sidebar_list = None    # inner frame rows live in
+        self._map_sidebar_rows: dict = {}   # key -> row label widget
+        self._map_sidebar_count = None  # "N points · M selected" label
+        self._map_detail = None        # detail Text widget
+        self._map_sidebar_sig = None   # signature the row list was built for
         self._ip_actions_text = None
         self._update_job = None
         self._status_job = None
@@ -24223,8 +24302,13 @@ class GNATracerGUI:
         bar = tk.Frame(parent, bg=P['panel'], height=28)
         bar.pack(fill="x", side="top")
         bar.pack_propagate(False)
-        tk.Label(bar, text="🔍", bg=P['panel'], fg=P['dim'],
-                 font=("Consolas", 10)).pack(side="left", padx=(8, 2))
+        mag_lbl = tk.Label(bar, text="🔍", bg=P['panel'], fg=P['dim'],
+                           font=("Consolas", 10))
+        mag_lbl.pack(side="left", padx=(8, 2))
+        _add_tooltip(mag_lbl,
+            "Search filter\n─────────────────────\n"
+            "Type in the box to live-filter the\n"
+            "rows below. ✕ clears the filter.")
         entry = tk.Entry(bar, textvariable=search_var, bg=P['entry'], fg=P['accent'],
                          insertbackground=P['accent'], font=("Consolas", 9),
                          bd=0, highlightthickness=1, highlightcolor=P['border'])
@@ -24244,6 +24328,10 @@ class GNATracerGUI:
         count_lbl = tk.Label(bar, text="", bg=P['panel'], fg=P['accent'],
                              font=("Consolas", 8, "bold"))
         count_lbl.pack(side="right", padx=(0, 2))
+        _add_tooltip(count_lbl,
+            "Match counter\n─────────────────────\n"
+            "Rows matching the current search\n"
+            "filter / total rows in the view.")
         self._search_labels[str(search_var)] = count_lbl
         return bar
 
@@ -24768,7 +24856,8 @@ class GNATracerGUI:
         z = self._map_zoom
         w, h = self._map_w, self._map_h
         if z >= 1:
-            font_size = max(7, min(11, int(7 + z)))
+            font_size = max(4, round(max(7, min(11, int(7 + z)))
+                                     * _MAP_MARKER_SCALE))
             for lat, lon, name in _COUNTRY_LABELS:
                 x, y = self._latlon_to_xy(lat, lon)
                 if 0 <= x <= w and 0 <= y <= h:
@@ -24782,13 +24871,15 @@ class GNATracerGUI:
                     continue
                 x, y = self._latlon_to_xy(lat, lon)
                 if 0 <= x <= w and 0 <= y <= h:
-                    r = 2
+                    r = 2 * _MAP_MARKER_SCALE
                     self._map_canvas.create_oval(
                         x - r, y - r, x + r, y + r,
                         fill="#556666", outline="#778888", tags="city")
                     self._map_canvas.create_text(
                         x + 5, y, text=name, fill="#667777",
-                        font=("Consolas", max(7, min(9, int(6 + z * 0.5)))),
+                        font=("Consolas",
+                              max(4, round(max(7, min(9, int(6 + z * 0.5)))
+                                           * _MAP_MARKER_SCALE))),
                         anchor="w", tags="city")
 
     # --- Map interaction handlers ---
@@ -25231,6 +25322,401 @@ class GNATracerGUI:
             self._plot_map_dots(self._last_map_data)
         self._plot_trace_on_map()
 
+    # ================== PINPOINT / GEO SIDEBAR ==================
+    # Every mapped point — IP pinpoints plus geo locations that have no IP
+    # but are relevant to an observed connection (your local marker, trace
+    # hops, trilateration fixes, RF sensors, traced emitters) — is listed
+    # in the scrollable sidebar. Clicking a row toggles it in a
+    # multi-select set: every selected point gets a map ring, the
+    # last-clicked row gets the "every field" detail dump, and
+    # ✖ DESELECT ALL resets to the default state.
+    _MAP_SEL_ICON = {'ip': '●', 'local': '📍', 'hop': '↳',
+                     'fix': '◎', 'sensor': '◆', 'em': '✶'}
+    # Emitter roles that describe this machine itself — censused but not
+    # something you "locate" as a separate geo point.
+    _MAP_SEL_SELF_ROLES = {'local-transmitter', 'local-interface',
+                         'analysis-gear'}
+
+    def _build_map_sidebar(self, parent):
+        """Right-edge sidebar: scrollable pinpoint/geo list + detail pane."""
+        sb = self._map_sidebar = tk.Frame(parent, bg="#101018", width=292)
+        sb.pack(side="right", fill="y", padx=(0, 2), pady=2)
+        sb.pack_propagate(False)
+        hdr = tk.Label(sb, text="PINPOINTS & GEO LOCATIONS",
+                       bg="#1a1a2e", fg="#ff5566",
+                       font=("Consolas", 8, "bold"))
+        hdr.pack(fill="x")
+        _add_tooltip(hdr,
+            "Every mapped point\n─────────────────────\n"
+            "IP pinpoints plus geo locations with no\n"
+            "IP that relate to an observed connection:\n"
+            "your local marker, trace hops, trilater-\n"
+            "ation fixes, RF sensors and traced emitters.\n\n"
+            "Click a row to select it and see every\n"
+            "field. Click again to toggle it off —\n"
+            "multiple points can stay selected at\n"
+            "once. ✖ DESELECT ALL resets the view.")
+        ctl = tk.Frame(sb, bg="#101018")
+        ctl.pack(fill="x", padx=4, pady=(3, 1))
+        btn_desel = tk.Button(ctl, text="✖ DESELECT ALL", bg="#333344",
+                              fg="#ffcc66", font=("Consolas", 7, "bold"),
+                              bd=0, padx=6, command=self._map_deselect_all)
+        btn_desel.pack(side="left")
+        _add_tooltip(btn_desel,
+            "Deselect everything\n─────────────────────\n"
+            "Clears every selected row, the detail\n"
+            "pane and all selection rings — back to\n"
+            "the default map state.")
+        btn_center = tk.Button(ctl, text="⌖", bg="#333344", fg="#a0a0b0",
+                               font=("Consolas", 8, "bold"), bd=0, padx=6,
+                               command=self._map_center_on_selection)
+        btn_center.pack(side="left", padx=(3, 0))
+        _add_tooltip(btn_center,
+            "Center on selection\n─────────────────────\n"
+            "Pans the map to the last-selected point\n"
+            "(or the middle of the selected set).")
+        self._map_sidebar_count = tk.Label(ctl, text="", bg="#101018",
+                                           fg="#00d4ff", font=("Consolas", 7))
+        self._map_sidebar_count.pack(side="right", padx=2)
+        _add_tooltip(self._map_sidebar_count,
+            "Selection count\n─────────────────────\n"
+            "pts = rows listed · sel = currently\n"
+            "toggled on (ringed on the map).")
+        leg = tk.Label(sb,
+            text="● ip  📍 you  ↳ hop  ◎ fix  ◆ sensor  ✶ emitter",
+            bg="#101018", fg="#6a7a9a", font=("Consolas", 7))
+        leg.pack(fill="x", padx=4)
+        _add_tooltip(leg,
+            "Row kinds\n─────────────────────\n"
+            "  ● ip      — connection endpoint pinpoint\n"
+            "  📍 you    — your own GeoIP marker (arc origin)\n"
+            "  ↳ hop     — traceroute hop geo point\n"
+            "  ◎ fix     — trilaterated emitter (no IP)\n"
+            "  ◆ sensor  — configured RF sensor node (no IP)\n"
+            "  ✶ emitter — traced signal device (no IP)")
+        # Scrollable row list — canvas + inner frame + scrollbar.
+        wrap = tk.Frame(sb, bg="#101018")
+        wrap.pack(fill="both", expand=True, padx=2, pady=(2, 0))
+        self._map_sidebar_canvas = tk.Canvas(
+            wrap, bg="#0d1117", highlightthickness=0)
+        vsb = tk.Scrollbar(wrap, orient="vertical",
+                           command=self._map_sidebar_canvas.yview)
+        self._map_sidebar_canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        self._map_sidebar_canvas.pack(side="left", fill="both", expand=True)
+        self._map_sidebar_list = tk.Frame(self._map_sidebar_canvas, bg="#0d1117")
+        _lwin = self._map_sidebar_canvas.create_window(
+            (0, 0), window=self._map_sidebar_list, anchor="nw")
+        self._map_sidebar_list.bind(
+            "<Configure>",
+            lambda e: self._map_sidebar_canvas.configure(
+                scrollregion=self._map_sidebar_canvas.bbox("all")))
+        self._map_sidebar_canvas.bind(
+            "<Configure>",
+            lambda e: self._map_sidebar_canvas.itemconfigure(
+                _lwin, width=e.width))
+        # Wheel over the list scrolls the list, not the map zoom.
+        self._map_sidebar_canvas.bind(
+            "<Enter>",
+            lambda e: self._map_sidebar_canvas.bind_all(
+                "<MouseWheel>", self._on_sidebar_wheel))
+        self._map_sidebar_canvas.bind(
+            "<Leave>",
+            lambda e: self._map_sidebar_canvas.unbind_all("<MouseWheel>"))
+        # Detail pane — every field of the last-selected point.
+        dhead = tk.Label(sb, text="SELECTED DETAIL — every field",
+                         bg="#1a1a2e", fg="#00d4ff",
+                         font=("Consolas", 8, "bold"))
+        dhead.pack(fill="x", pady=(3, 0))
+        _add_tooltip(dhead,
+            "Full detail dump\n─────────────────────\n"
+            "Every recorded field of the last-clicked\n"
+            "row — nothing filtered, same raw data\n"
+            "the map and inspector consume.")
+        self._map_detail = tk.Text(sb, bg="#0d1117", fg="#c0c0c0",
+                                   font=("Consolas", 8), height=17,
+                                   wrap="word", bd=0, highlightthickness=0)
+        self._map_detail.pack(fill="x", padx=2, pady=(0, 2))
+        self._map_detail_show(None)
+
+    def _on_sidebar_wheel(self, event):
+        try:
+            self._map_sidebar_canvas.yview_scroll(
+                int(-event.delta / 120), "units")
+        except Exception:
+            pass
+
+    def _map_sidebar_items(self, data):
+        """(kind, key, label, item) for every sidebar row."""
+        items = []
+        md = self._last_map_data or {}
+        for pt in md.get('all_points', []):
+            if not (pt.get('lat') or pt.get('lon')):
+                continue
+            ip = pt.get('ip', '?')
+            loc = ', '.join(x for x in (
+                pt.get('city') or '', pt.get('country_code') or
+                pt.get('country') or '') if x and x != '??')
+            items.append(('ip', f"ip:{ip}",
+                          f"{ip}  {loc or 'unresolved'}",
+                          dict(pt, _sel_kind='ip')))
+        lg = md.get('local_geo') or data.get('local_geo') or {}
+        if lg.get('lat') or lg.get('lon'):
+            items.append(('local', 'local',
+                          f"you  {lg.get('ip', '?')}  "
+                          f"{lg.get('city', '?')}, {lg.get('country_code', '?')}",
+                          dict(lg, _sel_kind='local')))
+        with self._trace_lock:
+            blocks = list(self._trace_blocks)
+        if blocks:
+            blk = blocks[-1]
+            for h in blk.get('hops', []):
+                if not (h.get('lat') or h.get('lon')):
+                    continue
+                ip = h.get('ip') or '* no-IP'
+                hloc = ', '.join(x for x in (
+                    h.get('city') or '', h.get('country') or '')
+                    if x and x != '??')
+                items.append(('hop', f"hop:{h.get('hop')}:{ip}",
+                              f"hop {h.get('hop')}  {ip}  {hloc}",
+                              dict(h, _sel_kind='hop',
+                                   _blk_target=blk.get('target'),
+                                   _blk_status=blk.get('status'))))
+        sp = data.get('spectrum') or {}
+        for key, fix in (sp.get('fixes') or {}).items():
+            if not fix.get('solved') or not (fix.get('lat') or fix.get('lon')):
+                continue
+            items.append(('fix', f"fix:{key}",
+                          f"{key}  ({fix['lat']:.3f},{fix['lon']:.3f}) "
+                          f"{fix.get('quality', '?')}",
+                          dict(fix, _sel_kind='fix', emitter=key)))
+        for name, s in (sp.get('sensors') or {}).items():
+            if not (s.get('lat') or s.get('lon')):
+                continue
+            items.append(('sensor', f"sensor:{name}",
+                          f"{name}  ({s.get('lat', 0):.3f},{s.get('lon', 0):.3f})",
+                          dict(s, _sel_kind='sensor', sensor=name)))
+        # Traced emitters — no IP by nature. A solved geo_fix gives true
+        # coords; unsolved ones are at your site (ring sits on YOU marker).
+        for em in sp.get('emitters') or []:
+            ex = em.get('extra') or {}
+            if ex.get('role') in self._MAP_SEL_SELF_ROLES or \
+                    'this-host' in ex.get('roles', []):
+                continue
+            nm = em.get('name') or em.get('address') or em.get('key', '?')
+            dist = f" ≈{_fmt_dist(em['dist_m'])}" \
+                if em.get('dist_m') is not None else ''
+            fx = em.get('geo_fix') or {}
+            pos = (f" ({fx['lat']:.3f},{fx['lon']:.3f})"
+                   if fx.get('solved') else " @site")
+            items.append(('em', f"em:{em.get('key', nm)}",
+                          f"{nm} [{em.get('medium', '?')}]{dist}{pos}",
+                          dict(em, _sel_kind='em')))
+        return items
+
+    def _map_sidebar_refresh(self, data):
+        """Rebuild the sidebar row list when the mapped data changed."""
+        if not self._map_sidebar_list:
+            return
+        items = self._map_sidebar_items(data)
+        live = {k for _k2, k, _l, _i in items}
+        for k in list(self._map_sel):          # prune selections for points
+            if k not in live:                   # that no longer exist
+                del self._map_sel[k]
+        if self._map_sel_last not in self._map_sel:
+            self._map_sel_last = next(reversed(self._map_sel), None) \
+                if self._map_sel else None
+        for w in self._map_sidebar_list.winfo_children():
+            w.destroy()
+        self._map_sidebar_rows.clear()
+        max_rows = 400
+        shown = items[:max_rows]
+        for kind, key, label, item in shown:
+            row = tk.Label(self._map_sidebar_list,
+                           text=f" {self._MAP_SEL_ICON.get(kind, '·')} {label}",
+                           bg="#0d1117", fg="#b8c8dd",
+                           font=("Consolas", 7), anchor="w", cursor="hand2")
+            row.pack(fill="x")
+            row.bind("<Button-1>",
+                     lambda e, k=key, it=item, kd=kind:
+                     self._map_sidebar_toggle(k, it, kd))
+            _add_tooltip(row,
+                f"{kind} point\n─────────────────────\n"
+                "Click to select — shows every field\n"
+                "below and rings it on the map.\n"
+                "Click again to toggle off.")
+            self._map_sidebar_rows[key] = row
+        if len(items) > max_rows:
+            tk.Label(self._map_sidebar_list,
+                     text=f" … +{len(items) - max_rows} more points",
+                     bg="#0d1117", fg="#5a6a7a",
+                     font=("Consolas", 7), anchor="w").pack(fill="x")
+        if not items:
+            tk.Label(self._map_sidebar_list,
+                     text=" no mapped points yet — waiting on\n GeoIP / traces / spectrum fixes",
+                     bg="#0d1117", fg="#5a6a7a",
+                     font=("Consolas", 7), anchor="w",
+                     justify="left").pack(fill="x")
+        self._map_sidebar_restyle()
+        self._map_update_sel_count(len(items))
+
+    def _map_sidebar_restyle(self):
+        """Highlight selected rows, dim the rest."""
+        for key, row in self._map_sidebar_rows.items():
+            try:
+                if key in self._map_sel:
+                    row.config(bg="#26334d", fg="#ffe066")
+                else:
+                    row.config(bg="#0d1117", fg="#b8c8dd")
+            except Exception:
+                pass
+
+    def _map_update_sel_count(self, n_points=None):
+        if self._map_sidebar_count is None:
+            return
+        n = len(self._map_sel)
+        pts = (f"{n_points} pts" if n_points is not None
+               else f"{len(self._map_sidebar_rows)} pts")
+        self._map_sidebar_count.config(
+            text=f"{pts} · {n} sel" if n else f"{pts}")
+
+    def _map_sidebar_toggle(self, key, item, kind):
+        """Toggle one row in the multi-select set."""
+        if key in self._map_sel:
+            del self._map_sel[key]
+            if self._selected_ip and key == f"ip:{self._selected_ip}":
+                self._selected_ip = next(
+                    (k[3:] for k in reversed(self._map_sel)
+                     if k.startswith('ip:')), None)
+        else:
+            self._map_sel[key] = item
+            if kind == 'ip':
+                self._selected_ip = item.get('ip')
+                self._inspector_select('ip', item.get('ip'))
+        if self._map_sel:
+            self._map_sel_last = key if key in self._map_sel \
+                else next(reversed(self._map_sel))
+        else:
+            self._map_sel_last = None
+        self._map_detail_show(self._map_sel.get(self._map_sel_last))
+        self._map_sidebar_restyle()
+        self._map_update_sel_count()
+        self._redraw_dots_only()
+
+    def _map_deselect_all(self):
+        """DESELECT ALL — reset selection, detail pane and rings."""
+        self._map_sel.clear()
+        self._map_sel_last = None
+        self._selected_ip = None
+        self._map_detail_show(None)
+        self._map_sidebar_restyle()
+        self._map_update_sel_count()
+        self._redraw_dots_only()
+
+    def _map_center_on_selection(self):
+        """Pan the map to the selection's midpoint."""
+        pts = []
+        for it in self._map_sel.values():
+            lat, lon = it.get('lat', 0), it.get('lon', 0)
+            if it.get('_sel_kind') == 'em':
+                fx = it.get('geo_fix') or {}
+                if fx.get('solved'):
+                    lat, lon = fx.get('lat', 0), fx.get('lon', 0)
+                elif (self._last_map_data or {}).get('local_geo'):
+                    lg = self._last_map_data['local_geo']
+                    lat, lon = lg.get('lat', 0), lg.get('lon', 0)
+            if lat or lon:
+                pts.append((lat, lon))
+        if not pts:
+            return
+        self._map_center_lat = sum(p[0] for p in pts) / len(pts)
+        self._map_center_lon = sum(p[1] for p in pts) / len(pts)
+        self._draw_map_full()
+        self._redraw_dots_only()
+
+    def _map_detail_show(self, item):
+        """Fill the detail pane with every recorded field of one point."""
+        w = self._map_detail
+        if not w:
+            return
+        w.config(state="normal")
+        w.delete("1.0", "end")
+        if not item:
+            w.insert("end", "Nothing selected — click a row above\n"
+                            "or a dot on the map. Click again to\n"
+                            "toggle off. Multiple points can stay\n"
+                            "selected at once; ✖ DESELECT ALL\n"
+                            "resets everything.")
+            w.config(state="disabled")
+            return
+        kind = item.get('_sel_kind', 'point')
+        icon = self._MAP_SEL_ICON.get(kind, '·')
+        w.insert("end", f"{icon} {kind.upper()}\n{'─' * 34}\n")
+        for k in sorted(item):
+            if k.startswith('_') and k not in ('_blk_target', '_blk_status'):
+                continue
+            v = item[k]
+            if isinstance(v, (list, tuple)):
+                vs = ', '.join(str(x) for x in v[:12]) or '[]'
+                if len(v) > 12:
+                    vs += f" …(+{len(v) - 12})"
+            elif isinstance(v, dict):
+                vs = ', '.join(f"{a}={b}" for a, b in
+                               list(v.items())[:12]) or '{}'
+                if len(v) > 12:
+                    vs += f" …(+{len(v) - 12})"
+            else:
+                vs = str(v)
+            if len(vs) > 200:
+                vs = vs[:200] + '…'
+            w.insert("end", f"{k:>16}: {vs}\n")
+        w.config(state="disabled")
+
+    def _plot_sel_extras(self):
+        """Ring every selected non-IP point (fixes, hops, sensors, local,
+        traced emitters — unsolved ones ring at the YOU site marker)."""
+        if not self._map_canvas:
+            return
+        lg = (self._last_map_data or {}).get('local_geo') or {}
+        for key, item in self._map_sel.items():
+            kind = item.get('_sel_kind')
+            if kind == 'ip':
+                continue  # IP points get their ring in _plot_map_dots
+            lat, lon = item.get('lat', 0), item.get('lon', 0)
+            if kind == 'em':
+                fx = item.get('geo_fix') or {}
+                if fx.get('solved'):
+                    lat, lon = fx.get('lat', 0), fx.get('lon', 0)
+                elif lg.get('lat') or lg.get('lon'):
+                    # unsolved emitter is at your site — ring on YOU
+                    lat, lon = lg.get('lat', 0), lg.get('lon', 0)
+                else:
+                    continue
+            if not (lat or lon):
+                continue
+            x, y = self._latlon_to_xy(lat, lon)
+            w, h = self._map_w, self._map_h
+            if x < -30 or x > w + 30 or y < -30 or y > h + 30:
+                continue
+            self._sel_ring(x, y, item)
+
+    def _sel_ring(self, x, y, item):
+        """Yellow selection ring + label around one non-IP map point."""
+        r = 11 * _MAP_MARKER_SCALE
+        self._map_canvas.create_oval(
+            x - r, y - r, x + r, y + r,
+            outline="#ffe066", width=2, tags="dot")
+        cd = 3 * _MAP_MARKER_SCALE
+        self._map_canvas.create_oval(
+            x - cd, y - cd, x + cd, y + cd,
+            fill="#ffe066", outline="#ffffff", width=1, tags="dot")
+        kind = item.get('_sel_kind', 'point')
+        lbl = (item.get('name') or item.get('emitter') or item.get('sensor')
+               or (f"hop {item.get('hop')}" if kind == 'hop' else None)
+               or item.get('ip') or kind)
+        self._map_chip_label(
+            x + r + 8, y, str(lbl)[:34], "#ffe066", 9, anchor="w")
+
     def _plot_trace_on_map(self):
         """Plot trace hops on the map as a connected path with numbered hop markers.
         Only shows hops that have valid lat/lon coordinates.
@@ -25278,7 +25764,8 @@ class GNATracerGUI:
                     mid_y = (y1 + y2) / 2
                     self._map_canvas.create_text(
                         mid_x, mid_y - 6, text=f"+{delta_rtt:.0f}ms",
-                        fill="#ffaa44", font=("Consolas", 7),
+                        fill="#ffaa44",
+                        font=("Consolas", max(4, round(7 * _MAP_MARKER_SCALE))),
                         anchor="center", tags="trace_path")
         # Draw hop markers with RTT distance rings
         for i, (x, y, hop) in enumerate(points):
@@ -25312,13 +25799,14 @@ class GNATracerGUI:
                         outline=color, width=1, stipple="gray25",
                         tags="trace_path")
             # Draw hop marker
-            r = 6
+            r = 6 * _MAP_MARKER_SCALE
             self._map_canvas.create_oval(
                 x - r, y - r, x + r, y + r,
                 fill=color, outline="#ffffff", width=2, tags="trace_hop")
             self._map_canvas.create_text(
                 x, y, text=str(hop_no), fill="#ffffff",
-                font=("Consolas", 7, "bold"), tags="trace_hop")
+                font=("Consolas", max(4, round(7 * _MAP_MARKER_SCALE)), "bold"),
+                tags="trace_hop")
             # Show IP + RTT label at higher zoom
             if self._map_zoom >= 4:
                 ip = hop.get("ip", "")
@@ -25329,7 +25817,9 @@ class GNATracerGUI:
                     self._map_canvas.create_text(
                         x + r + 2, y, text=f"{ip}{rtt_str}{label_str}",
                         fill=color,
-                        font=("Consolas", max(7, min(9, int(6 + self._map_zoom * 0.3))), "bold"),
+                        font=("Consolas",
+                              max(4, round(max(7, min(9, int(6 + self._map_zoom * 0.3)))
+                                           * _MAP_MARKER_SCALE)), "bold"),
                         anchor="w", tags="trace_hop")
 
     def _show_tooltip(self, event, text, delay_ms: int = 350):
@@ -25346,6 +25836,7 @@ class GNATracerGUI:
     def _render_tooltip(self, x, y, text):
         self._tooltip_id = None
         self._tooltip = tk.Toplevel(self._root)
+        self._tooltip._gna_is_tip = True
         self._tooltip.wm_overrideredirect(True)
         self._tooltip.wm_geometry(f"+{x}+{y}")
         self._tooltip.attributes("-topmost", True)
@@ -25368,6 +25859,65 @@ class GNATracerGUI:
             except Exception:
                 pass
             self._tooltip = None
+
+    # ---------- universal label hover descriptions ----------
+    def _install_label_tooltips(self):
+        """Class-level <Enter> bindings so EVERY Label in the program —
+        existing, future, and inside any popup — gets a hover description.
+        Labels that already carry an explicit _add_tooltip are skipped via
+        the _gna_has_tip flag; labels inside tooltip popups are skipped via
+        the _gna_is_tip flag on their Toplevel."""
+        for cls in ("Label", "TLabel"):
+            try:
+                self._root.bind_class(cls, "<Enter>",
+                                      self._label_tip_enter, add="+")
+            except Exception:
+                pass
+
+    def _label_tip_enter(self, event):
+        """Fallback hover handler for labels without an explicit tooltip.
+        Lazily attaches a WidgetTooltip whose text resolves live from
+        _describe_label, so counters and other dynamic labels always show
+        their current content."""
+        w = event.widget
+        try:
+            if getattr(w, '_gna_has_tip', False):
+                return
+            if getattr(w.winfo_toplevel(), '_gna_is_tip', False):
+                return
+            tip = getattr(w, '_gna_auto_tip', None)
+            if tip is None:
+                tip = _add_tooltip(w, lambda ww=w: self._describe_label(ww))
+                w._gna_auto_tip = tip
+            # The widget-level <Enter> binding was just installed — too late
+            # to catch this event — so schedule the popup directly.
+            tip._on_enter(event)
+        except Exception:
+            pass
+
+    def _describe_label(self, w):
+        """Describe whatever the pointer is hovering over. Priority:
+        registered description for known label texts, otherwise the
+        label's own current text (resolving textvariable when needed)."""
+        text = ""
+        try:
+            text = w.cget("text") or ""
+        except Exception:
+            pass
+        if not text:
+            try:
+                var = w.cget("textvariable")
+                if var:
+                    text = w.tk.globalgetvar(str(var)) or ""
+            except Exception:
+                pass
+        text = str(text).strip()
+        if not text:
+            return ""
+        desc = _LABEL_DESCRIPTIONS.get(' '.join(text.split()))
+        if desc:
+            return f"{text}\n{'─' * 24}\n{desc}"
+        return text
 
     def _on_map_dot_enter(self, event, ip, info):
         loc_conf = info.get('loc_confidence', 0)
@@ -25710,6 +26260,7 @@ class GNATracerGUI:
 
     def _run_gui(self):
         self._root = tk.Tk()
+        self._install_label_tooltips()
         self._root.title("GNA Tracer — Full Network Intelligence")
         self._root.geometry("1280x820")
         self._root.configure(bg="#0a0a0f")
@@ -25760,19 +26311,37 @@ class GNATracerGUI:
         hdr.pack_propagate(False)
         brand = tk.Frame(hdr, bg=P['panel'])
         brand.pack(side="left", padx=(12, 0), pady=7)
-        tk.Label(brand, text=" ♟ ", bg=P['brand'], fg="#ffffff",
-                 font=("Consolas", 16, "bold")).pack(side="left")
+        brand_icon = tk.Label(brand, text=" ♟ ", bg=P['brand'], fg="#ffffff",
+                              font=("Consolas", 16, "bold"))
+        brand_icon.pack(side="left")
+        _add_tooltip(brand_icon,
+            "GNA Tracer\n─────────────────────\n"
+            "Full Network Intelligence —\n"
+            "deductive connection monitor.")
         title_col = tk.Frame(brand, bg=P['panel'])
         title_col.pack(side="left", padx=(10, 0))
-        tk.Label(title_col, text="GNA TRACER", bg=P['panel'], fg=P['text'],
-                 font=("Consolas", 15, "bold"), anchor="w").pack(fill="x")
+        title_lbl = tk.Label(title_col, text="GNA TRACER", bg=P['panel'],
+                             fg=P['text'], font=("Consolas", 15, "bold"),
+                             anchor="w")
+        title_lbl.pack(fill="x")
+        _add_tooltip(title_lbl,
+            "GNA Tracer\n─────────────────────\n"
+            "Full Network Intelligence —\n"
+            "deductive connection monitor.")
         # Submarine mode-blurb: the subtitle line carries "-- <current view>"
         # inline (same baseline, accent colour); _on_tab_changed syncs it.
         sub_row = tk.Frame(title_col, bg=P['panel'])
         sub_row.pack(fill="x")
-        tk.Label(sub_row, text="FULL NETWORK INTELLIGENCE · DEDUCTIVE MONITOR",
-                 bg=P['panel'], fg=P['dim'], font=("Consolas", 7),
-                 anchor="w").pack(side="left")
+        sub_lbl = tk.Label(sub_row,
+                           text="FULL NETWORK INTELLIGENCE · DEDUCTIVE MONITOR",
+                           bg=P['panel'], fg=P['dim'], font=("Consolas", 7),
+                           anchor="w")
+        sub_lbl.pack(side="left")
+        _add_tooltip(sub_lbl,
+            "Monitor tagline\n─────────────────────\n"
+            "Full network intelligence — every\n"
+            "connection enriched, verified and\n"
+            "deductively scored.")
         self._mode_blurb = tk.Label(sub_row, text="── OVERVIEW · system dashboard",
                                     bg=P['panel'], fg=P['accent'],
                                     font=("Consolas", 7, "bold"), anchor="w")
@@ -25822,6 +26391,10 @@ class GNATracerGUI:
         self._spark_lbl = tk.Label(spark_box, text="TH —", bg=P['panel'],
                                    fg=P['dim'], font=("Consolas", 7, "bold"))
         self._spark_lbl.pack()
+        _add_tooltip(self._spark_lbl,
+            "Threat score readout\n─────────────────────\n"
+            "Numeric form of the sparkline below —\n"
+            "the live composite threat score.")
         self._spark_canvas = tk.Canvas(spark_box, width=84, height=16,
                                        bg=P['track'], highlightthickness=1,
                                        highlightbackground=P['border'])
@@ -25854,6 +26427,10 @@ class GNATracerGUI:
         self._date_lbl = tk.Label(clock_col, text="", bg=P['panel'], fg=P['dim'],
                                   font=("Consolas", 7), anchor="e")
         self._date_lbl.pack(fill="x")
+        _add_tooltip(self._date_lbl,
+            "Local date\n─────────────────────\n"
+            "Today's date — pairs with the\n"
+            "wall-clock time above it.")
         _add_tooltip(self._clock_lbl,
             "Local clock\n─────────────────────\n"
             "Wall-clock time — useful for correlating\n"
@@ -25902,13 +26479,15 @@ class GNATracerGUI:
                          highlightbackground=P['border'])
             padx = (6 if i == 0 else 3, 6 if i == len(chip_specs) - 1 else 0)
             f.pack(side="left", fill="x", expand=True, padx=padx, pady=4)
-            tk.Label(f, text=name, bg=P['card'], fg=P['dim'],
-                     font=("Consolas", 7, "bold")).pack(side="left", padx=(8, 4))
+            name_lbl = tk.Label(f, text=name, bg=P['card'], fg=P['dim'],
+                                font=("Consolas", 7, "bold"))
+            name_lbl.pack(side="left", padx=(8, 4))
             v = tk.Label(f, text="—", bg=P['card'], fg=P['text'],
                          font=("Consolas", 11, "bold"), anchor="e")
             v.pack(side="right", padx=(4, 8))
             _add_tooltip(f, tip)
             _add_tooltip(v, tip)
+            _add_tooltip(name_lbl, tip)
             self._chips[key] = v
 
         # ==================== SENSORS STRIP: every extended monitor ========
@@ -25917,8 +26496,14 @@ class GNATracerGUI:
         strip2 = tk.Frame(self._root, bg=P['bg'], height=22)
         strip2.pack(fill="x")
         strip2.pack_propagate(False)
-        tk.Label(strip2, text="SENS", bg=P['bg'], fg=P['faint'],
-                 font=("Consolas", 7, "bold")).pack(side="left", padx=(8, 4))
+        sens_lbl = tk.Label(strip2, text="SENS", bg=P['bg'], fg=P['faint'],
+                            font=("Consolas", 7, "bold"))
+        sens_lbl.pack(side="left", padx=(8, 4))
+        _add_tooltip(sens_lbl,
+            "Sensor strip\n─────────────────────\n"
+            "One live chip per detection engine,\n"
+            "feed and cache. Hover any chip for\n"
+            "what it counts.")
         self._sensor_chips = {}
         sensor_specs = [
             ('fs',    'FS',    "File-system watchdog\n─────────────────────\n"
@@ -26047,8 +26632,14 @@ class GNATracerGUI:
         strip3 = tk.Frame(self._root, bg=P['bg'], height=22)
         strip3.pack(fill="x")
         strip3.pack_propagate(False)
-        tk.Label(strip3, text="FLOW", bg=P['bg'], fg=P['faint'],
-                 font=("Consolas", 7, "bold")).pack(side="left", padx=(8, 4))
+        flow_lbl = tk.Label(strip3, text="FLOW", bg=P['bg'], fg=P['faint'],
+                            font=("Consolas", 7, "bold"))
+        flow_lbl.pack(side="left", padx=(8, 4))
+        _add_tooltip(flow_lbl,
+            "Flow strip\n─────────────────────\n"
+            "Live socket-state totals, interface\n"
+            "throughput and the verification\n"
+            "ledger. Hover any chip for detail.")
         for key, cap, tip in (
             ('est', 'EST',  "ESTABLISHED sockets\n─────────────────────\n"
                             "Open, data-carrying connections right now."),
@@ -26075,8 +26666,13 @@ class GNATracerGUI:
             _add_tooltip(c, tip)
             self._flow_lbls[key] = c
         # Divider, then summed interface throughput (▲ up / ▼ down).
-        tk.Label(strip3, text="│", bg=P['bg'], fg=P['border'],
-                 font=("Consolas", 8)).pack(side="left", padx=(6, 2))
+        div_lbl = tk.Label(strip3, text="│", bg=P['bg'], fg=P['border'],
+                           font=("Consolas", 8))
+        div_lbl.pack(side="left", padx=(6, 2))
+        _add_tooltip(div_lbl,
+            "Section divider\n─────────────────────\n"
+            "Separates socket-state chips from\n"
+            "interface throughput on this strip.")
         self._flow_lbls['up'] = tk.Label(strip3, text=" ▲ — ", bg=P['panel_hi'],
                                          fg=P['dim'], font=("Consolas", 7, "bold"),
                                          highlightthickness=1,
@@ -26098,8 +26694,13 @@ class GNATracerGUI:
             "network interface (1s samples — per-iface\n"
             "detail + sparklines in the NETST tab).")
         # Divider, then the verification ledger (VER = graded, CONFL = conflicts).
-        tk.Label(strip3, text="│", bg=P['bg'], fg=P['border'],
-                 font=("Consolas", 8)).pack(side="left", padx=(6, 2))
+        div2_lbl = tk.Label(strip3, text="│", bg=P['bg'], fg=P['border'],
+                            font=("Consolas", 8))
+        div2_lbl.pack(side="left", padx=(6, 2))
+        _add_tooltip(div2_lbl,
+            "Section divider\n─────────────────────\n"
+            "Separates throughput from the\n"
+            "verification ledger on this strip.")
         self._flow_lbls['ver'] = tk.Label(strip3, text=" VER — ", bg=P['panel_hi'],
                                           fg=P['dim'], font=("Consolas", 7, "bold"),
                                           highlightthickness=1,
@@ -26159,12 +26760,24 @@ class GNATracerGUI:
             "Severity color legend\n─────────────────────\n"
             "The same colors mean the same thing in\n"
             "every tab, chip, card and map dot.")
+        leg_descs = {
+            'CRIT': "Critical — high-risk endpoint,\ncritical deduction or fail state.",
+            'WARN': "Warning — elevated risk or a\ncheck that needs attention.",
+            'OK':   "OK — clean / low-risk / pass.",
+            'VPN':  "VPN/proxy — location shown is\nthe exit node, not the client.",
+        }
         for col, name in ((P['bad'], 'CRIT'), (P['warn'], 'WARN'),
                           (P['good'], 'OK'), (P['purple'], 'VPN')):
-            tk.Label(leg, text="●", bg=P['panel'], fg=col,
-                     font=("Consolas", 8)).pack(side="left")
-            tk.Label(leg, text=name, bg=P['panel'], fg=P['faint'],
-                     font=("Consolas", 7)).pack(side="left", padx=(1, 6))
+            dot_lbl = tk.Label(leg, text="●", bg=P['panel'], fg=col,
+                               font=("Consolas", 8))
+            dot_lbl.pack(side="left")
+            nm_lbl = tk.Label(leg, text=name, bg=P['panel'], fg=P['faint'],
+                              font=("Consolas", 7))
+            nm_lbl.pack(side="left", padx=(1, 6))
+            _leg_tip = (f"Legend · {name}\n─────────────────────\n"
+                        f"{leg_descs[name]}")
+            _add_tooltip(dot_lbl, _leg_tip)
+            _add_tooltip(nm_lbl, _leg_tip)
         self._tabpos_lbl = tk.Label(navrow, text="[01/17]", bg=P['panel'],
                                     fg=P['faint'], font=("Consolas", 8, "bold"))
         self._tabpos_lbl.pack(side="left", padx=(10, 0))
@@ -26176,6 +26789,10 @@ class GNATracerGUI:
         self._hint_lbl = tk.Label(navrow, text="", bg=P['panel'], fg=P['dim'],
                                   font=("Consolas", 8), anchor="w")
         self._hint_lbl.pack(side="left", padx=10, fill="x", expand=True)
+        _add_tooltip(self._hint_lbl,
+            "Contextual hint\n─────────────────────\n"
+            "A quick usage tip that follows\n"
+            "whichever tab is selected.")
         # ---- row 1: status chips + session clocks ----
         sb = tk.Frame(sbb, bg=P['panel'], height=24)
         sb.pack(fill="x", side="top")
@@ -26283,8 +26900,14 @@ class GNATracerGUI:
                         highlightthickness=1, highlightbackground=P['border'])
         prow.pack(fill="x", padx=4, pady=4)
         prow.pack_propagate(False)
-        tk.Label(prow, text=" POSTURE ", bg=P['panel'], fg=P['dim'],
-                 font=("Consolas", 8, "bold")).pack(side="left", padx=(8, 4), pady=3)
+        post_lbl = tk.Label(prow, text=" POSTURE ", bg=P['panel'], fg=P['dim'],
+                            font=("Consolas", 8, "bold"))
+        post_lbl.pack(side="left", padx=(8, 4), pady=3)
+        _add_tooltip(post_lbl,
+            "Posture strip\n─────────────────────\n"
+            "One chip per security check — lit =\n"
+            "active/pass, dim = off. Hover each\n"
+            "chip for what it measures.")
         self._posture_chips = {}
         for key, caption, tip in (
             ('cap',   'CAPTURE',  "Packet capture\n─────────────────────\n"
@@ -26324,6 +26947,10 @@ class GNATracerGUI:
         self._posture_gauge_lbl = tk.Label(gfr, text="TH —", bg=P['panel'],
                                            fg=P['dim'], font=("Consolas", 7, "bold"))
         self._posture_gauge_lbl.pack(side="left", padx=(0, 4))
+        _add_tooltip(self._posture_gauge_lbl,
+            "Threat score\n─────────────────────\n"
+            "Numeric form of the gauge beside it —\n"
+            "same composite as the header chip.")
         track = tk.Frame(gfr, bg=P['panel_hi'], width=72, height=8,
                          highlightthickness=1, highlightbackground=P['border'])
         track.pack(side="left", pady=3)
@@ -26415,14 +27042,16 @@ class GNATracerGUI:
             cell = tk.Frame(led, bg=P['bg'])
             cell.grid(row=r, column=c, sticky='w')
             led.grid_columnconfigure(c, weight=1)
-            tk.Label(cell, text=f"{name}", bg=P['bg'], fg=P['faint'],
-                     font=("Consolas", 7, "bold"), anchor="w",
-                     width=12).pack(side="left")
+            name_lbl = tk.Label(cell, text=f"{name}", bg=P['bg'], fg=P['faint'],
+                                font=("Consolas", 7, "bold"), anchor="w",
+                                width=12)
+            name_lbl.pack(side="left")
             v = tk.Label(cell, text="—", bg=P['bg'], fg=P['text'],
                          font=("Consolas", 7, "bold"), anchor="w")
             v.pack(side="left")
             _add_tooltip(v, tip)
             _add_tooltip(cell, tip)
+            _add_tooltip(name_lbl, tip)
             self._ov_ledger[key] = v
         self._ov_sysline = None  # replaced by the ledger grid above
         self._make_search_bar(self._overview_frame, self._search_overview)
@@ -26493,8 +27122,16 @@ class GNATracerGUI:
             "─────────────────────\n"
             "Deletes all Windows Firewall rules prefixed with\n"
             "'GNA_Tracer_Block_' — unblocking all IPs at once.")
-        tk.Label(conn_toolbar, text="Click [Block] next to any connection to add a firewall rule",
-                 bg="#1a1a2e", fg="#7a7a8a", font=("Consolas", 8)).pack(side="right", padx=8)
+        blk_hint = tk.Label(conn_toolbar,
+            text="Click [Block] next to any connection to add a firewall rule",
+            bg="#1a1a2e", fg="#7a7a8a", font=("Consolas", 8))
+        blk_hint.pack(side="right", padx=8)
+        _add_tooltip(blk_hint,
+            "Firewall blocking\n─────────────────────\n"
+            "Every connection row has a [Block]\n"
+            "action — it creates a Windows Firewall\n"
+            "rule (GNA_Tracer_Block_*) dropping all\n"
+            "traffic to that remote IP.")
         # Connection search + list
         self._make_search_bar(self._conn_frame, self._search_conn)
         self._conn_text = scrolledtext.ScrolledText(
@@ -26565,8 +27202,14 @@ class GNATracerGUI:
             "Reset view\n─────────────────────\nReset map to default zoom (3.0),\n"
             "centered on your own location when known.")
         # Zoom slider
-        tk.Label(map_ctrl, text="Zoom:", bg="#1a1a2e", fg="#a0a0b0",
-                 font=("Consolas", 8)).pack(side="left", padx=(6, 2))
+        zoom_lbl = tk.Label(map_ctrl, text="Zoom:", bg="#1a1a2e", fg="#a0a0b0",
+                            font=("Consolas", 8))
+        zoom_lbl.pack(side="left", padx=(6, 2))
+        _add_tooltip(zoom_lbl,
+            "Map zoom control\n─────────────────────\n"
+            "Use ➖/➕, the slider, or the scroll\n"
+            "wheel over the map. 0 = world,\n"
+            "19 = street level.")
         self._map_zoom_slider = ttk.Scale(map_ctrl, from_=0, to=19,
                                           orient="horizontal", length=120,
                                           command=self._on_zoom_slider)
@@ -26584,8 +27227,14 @@ class GNATracerGUI:
             "Shows the current zoom factor and tile level.\n"
             "z = integer tile level (used for tile fetching)")
         # Tile style selector
-        tk.Label(map_ctrl, text="Style:", bg="#1a1a2e", fg="#a0a0b0",
-                 font=("Consolas", 8)).pack(side="left", padx=(8, 2))
+        style_lbl = tk.Label(map_ctrl, text="Style:", bg="#1a1a2e",
+                             fg="#a0a0b0", font=("Consolas", 8))
+        style_lbl.pack(side="left", padx=(8, 2))
+        _add_tooltip(style_lbl,
+            "Tile style selector\n─────────────────────\n"
+            "Pick the map's artwork — streets,\n"
+            "dark theme, satellite, terrain or\n"
+            "topographic tiles.")
         self._map_style_var = tk.StringVar(
             value=f"{TileManager.get_style()} — {TileManager.get_style_label()}")
         style_menu = ttk.Combobox(map_ctrl, textvariable=self._map_style_var,
@@ -26603,8 +27252,14 @@ class GNATracerGUI:
             "  Esri Terrain — terrain/relief\n"
             "  OpenTopoMap — topographic map")
         # Search / Go-to box
-        tk.Label(map_ctrl, text="Go to:", bg="#1a1a2e", fg="#a0a0b0",
-                 font=("Consolas", 8)).pack(side="left", padx=(8, 2))
+        goto_lbl = tk.Label(map_ctrl, text="Go to:", bg="#1a1a2e",
+                            fg="#a0a0b0", font=("Consolas", 8))
+        goto_lbl.pack(side="left", padx=(8, 2))
+        _add_tooltip(goto_lbl,
+            "Fly-to search\n─────────────────────\n"
+            "Type a city, country or lat,lon\n"
+            "and press Enter (or 🔍) to jump\n"
+            "the map there.")
         self._map_search_var = tk.StringVar()
         search_entry = tk.Entry(map_ctrl, textvariable=self._map_search_var,
                                 width=20, font=("Consolas", 9), bd=0,
@@ -26657,13 +27312,25 @@ class GNATracerGUI:
             "  Orange = High risk (41-70)\n"
             "  Red    = Critical risk (71+)\n"
             "  Purple = VPN/Proxy exit node")
+        _map_leg_descs = {
+            "Low":            "Low risk (0-20)",
+            "Med":            "Medium risk (21-40)",
+            "High":           "High risk (41-70)",
+            "Crit":           "Critical risk (71+)",
+            "VPN/Proxy Exit": "VPN/proxy exit node — location\n"
+                              "is the exit, not the client.",
+        }
         for color, label in [("#44cc44", "Low"), ("#ffcc00", "Med"),
                               ("#ff8800", "High"), ("#ff0000", "Crit"),
                               ("#cc00cc", "VPN/Proxy Exit")]:
             tk.Canvas(legend_f, bg=color, width=8, height=8,
                       highlightthickness=0).pack(side="left", padx=1)
-            tk.Label(legend_f, text=label, bg="#1a1a2e", fg="#a0a0b0",
-                     font=("Consolas", 7)).pack(side="left", padx=(0, 4))
+            leg_item = tk.Label(legend_f, text=label, bg="#1a1a2e",
+                                fg="#a0a0b0", font=("Consolas", 7))
+            leg_item.pack(side="left", padx=(0, 4))
+            _add_tooltip(leg_item,
+                f"Map legend · {label}\n─────────────────────\n"
+                f"{_map_leg_descs[label]}")
         # Radiant telemetry readout for the atlas itself — live dot census.
         self._map_count_lbl = tk.Label(map_ctrl, text="", bg="#1a1a2e",
                                        fg="#00d4ff", font=("Consolas", 8))
@@ -26676,8 +27343,14 @@ class GNATracerGUI:
         preset_bar = tk.Frame(self._map_frame, bg="#12121a", height=24)
         preset_bar.pack(fill="x")
         preset_bar.pack_propagate(False)
-        tk.Label(preset_bar, text="Presets:", bg="#12121a", fg="#8a8a9a",
-                 font=("Consolas", 7)).pack(side="left", padx=4)
+        pres_lbl = tk.Label(preset_bar, text="Presets:", bg="#12121a",
+                            fg="#8a8a9a", font=("Consolas", 7))
+        pres_lbl.pack(side="left", padx=4)
+        _add_tooltip(pres_lbl,
+            "Camera presets\n─────────────────────\n"
+            "One-click jumps to saved map\n"
+            "views — hover any preset for\n"
+            "its coordinates.")
         for label, lat, lon, z in [
             ("🌍 World", 20.0, 0.0, 2.0),
             ("🌎 N.America", 45.0, -100.0, 4.0),
@@ -26713,12 +27386,14 @@ class GNATracerGUI:
             "Shows/hides the map action log panel at the\n"
             "bottom of the map. The log records every\n"
             "map interaction (zoom, pan, search, trace).")
-        # --- Map canvas (fills remaining space) ---
+        # --- Map canvas (fills remaining space) + pinpoint sidebar (right) ---
         map_top = tk.Frame(self._map_frame, bg="#0a0a0f")
         map_top.pack(fill="both", expand=True)
+        # Sidebar first (pack right) so the canvas takes the leftover space.
+        self._build_map_sidebar(map_top)
         self._map_canvas = tk.Canvas(map_top, bg="#0d1117", width=self._map_w,
                                      height=self._map_h, highlightthickness=0)
-        self._map_canvas.pack(fill="both", expand=True, padx=2, pady=2)
+        self._map_canvas.pack(side="left", fill="both", expand=True, padx=2, pady=2)
         # Bind zoom (mouse wheel) and pan (both left and right click-drag)
         self._map_canvas.bind("<MouseWheel>", self._on_map_scroll)
         self._map_canvas.bind("<Button-4>", lambda e: self._map_zoom_by(1.15, e))
@@ -26749,9 +27424,16 @@ class GNATracerGUI:
         self._map_action_log_frame = tk.Frame(self._map_frame, bg="#0a0a0f", height=140)
         self._map_action_log_frame.pack(fill="both", expand=False)
         self._map_action_log_frame.pack_propagate(False)
-        tk.Label(self._map_action_log_frame,
+        iplog_lbl = tk.Label(self._map_action_log_frame,
                  text="IP ACTION LOG (click a dot · scroll=zoom · drag=pan · arrows=navigate · ❓=help)",
-                 bg="#1a1a2e", fg="#ff5566", font=("Consolas", 8, "bold")).pack(fill="x")
+                 bg="#1a1a2e", fg="#ff5566", font=("Consolas", 8, "bold"))
+        iplog_lbl.pack(fill="x")
+        _add_tooltip(iplog_lbl,
+            "IP action log\n─────────────────────\n"
+            "Live feed of map interactions and\n"
+            "per-IP actions — dot clicks, blocks,\n"
+            "traces and inspect events.\n"
+            "Hide it with 📋 Toggle Log.")
         self._ip_actions_text = scrolledtext.ScrolledText(
             self._map_action_log_frame, bg="#12121a", fg="#c0c0c0",
             font=("Consolas", 9), insertbackground="#c0c0c0", state="disabled",
@@ -26850,8 +27532,14 @@ class GNATracerGUI:
         trace_bar1 = tk.Frame(self._trace_frame, bg="#1a1a2e", height=34)
         trace_bar1.pack(fill="x", side="top")
         trace_bar1.pack_propagate(False)
-        tk.Label(trace_bar1, text="🎯 Target:", bg="#1a1a2e", fg="#00d4ff",
-                 font=("Consolas", 9, "bold")).pack(side="left", padx=(8, 2))
+        tgt_lbl = tk.Label(trace_bar1, text="🎯 Target:", bg="#1a1a2e",
+                           fg="#00d4ff", font=("Consolas", 9, "bold"))
+        tgt_lbl.pack(side="left", padx=(8, 2))
+        _add_tooltip(tgt_lbl,
+            "Trace target\n─────────────────────\n"
+            "Pick a connected IP from the list or\n"
+            "type any host/IP — ▶ Trace runs a\n"
+            "hop-by-hop path to it.")
         self._trace_target_var = tk.StringVar()
         self._trace_target_combo = ttk.Combobox(
             trace_bar1, textvariable=self._trace_target_var, font=("Consolas", 9),
@@ -26903,12 +27591,21 @@ class GNATracerGUI:
         self._trace_status_lbl = tk.Label(trace_bar1, text="Idle", bg="#1a1a2e",
                                           fg="#a0a0b0", font=("Consolas", 9))
         self._trace_status_lbl.pack(side="right", padx=12)
+        _add_tooltip(self._trace_status_lbl,
+            "Trace status\n─────────────────────\n"
+            "What the traceroute engine is doing\n"
+            "right now — Idle / Running / Done.")
         # --- Toolbar row 2: options + logging ---
         trace_bar2 = tk.Frame(self._trace_frame, bg="#141426", height=30)
         trace_bar2.pack(fill="x", side="top")
         trace_bar2.pack_propagate(False)
-        tk.Label(trace_bar2, text="Max hops:", bg="#141426", fg="#a0a0b0",
-                 font=("Consolas", 8)).pack(side="left", padx=(8, 2))
+        mh_lbl = tk.Label(trace_bar2, text="Max hops:", bg="#141426",
+                          fg="#a0a0b0", font=("Consolas", 8))
+        mh_lbl.pack(side="left", padx=(8, 2))
+        _add_tooltip(mh_lbl,
+            "Maximum hops\n─────────────────────\n"
+            "TTL ceiling for the trace — how many\n"
+            "routers deep to probe (default 30).")
         self._trace_maxhops_var = tk.StringVar(value="30")
         tk.Entry(trace_bar2, textvariable=self._trace_maxhops_var, width=4,
                  bg="#222233", fg="#00d4ff", insertbackground="#00d4ff",
@@ -26931,8 +27628,13 @@ class GNATracerGUI:
             "  • RDAP/WHOIS lookup\n"
             "  • Reverse DNS\n"
             "Significantly slower but more detailed.")
-        tk.Label(trace_bar2, text="Rotate log at (KB):", bg="#141426", fg="#a0a0b0",
-                 font=("Consolas", 8)).pack(side="left", padx=(10, 2))
+        rot_lbl = tk.Label(trace_bar2, text="Rotate log at (KB):",
+                           bg="#141426", fg="#a0a0b0", font=("Consolas", 8))
+        rot_lbl.pack(side="left", padx=(10, 2))
+        _add_tooltip(rot_lbl,
+            "Log rotation size\n─────────────────────\n"
+            "Start a new trace log file once the\n"
+            "current one exceeds this size (KB).")
         self._trace_rotatekb_var = tk.StringVar(value="1024")
         tk.Entry(trace_bar2, textvariable=self._trace_rotatekb_var, width=7,
                  bg="#222233", fg="#00d4ff", insertbackground="#00d4ff",
@@ -26969,8 +27671,13 @@ class GNATracerGUI:
             "Saves all trace results as a spreadsheet-\n"
             "compatible CSV file (hop, IP, RTT, geo, label).")
         # Auto-retrace interval
-        tk.Label(trace_bar2, text="Auto (s):", bg="#141426", fg="#a0a0b0",
-                 font=("Consolas", 8)).pack(side="left", padx=(10, 2))
+        auto_lbl = tk.Label(trace_bar2, text="Auto (s):", bg="#141426",
+                            fg="#a0a0b0", font=("Consolas", 8))
+        auto_lbl.pack(side="left", padx=(10, 2))
+        _add_tooltip(auto_lbl,
+            "Auto-retrace interval\n─────────────────────\n"
+            "Re-run the trace every N seconds.\n"
+            "0 = disabled.")
         self._trace_auto_var = tk.StringVar(value="0")
         tk.Entry(trace_bar2, textvariable=self._trace_auto_var, width=4,
                  bg="#222233", fg="#00d4ff", insertbackground="#00d4ff",
@@ -26983,6 +27690,11 @@ class GNATracerGUI:
         self._trace_logfile_lbl = tk.Label(trace_bar2, text="", bg="#141426",
                                            fg="#556655", font=("Consolas", 8))
         self._trace_logfile_lbl.pack(side="right", padx=6)
+        _add_tooltip(self._trace_logfile_lbl,
+            "Trace log file\n─────────────────────\n"
+            "Name of the file the current trace\n"
+            "output is being written to.\n"
+            "📁 Open Log Folder opens it.")
         # --- Search + output ---
         self._make_search_bar(self._trace_frame, self._search_trace)
         self._trace_text = scrolledtext.ScrolledText(
@@ -28410,14 +29122,23 @@ class GNATracerGUI:
         strip.pack(side="left", fill="y")
         body = tk.Frame(card, bg=P['card'])
         body.pack(side="left", fill="both", expand=True, padx=6, pady=3)
-        tk.Label(body, text=title, bg=P['card'], fg=P['dim'],
-                 font=("Consolas", 7, "bold"), anchor="w").pack(fill="x")
+        title_l = tk.Label(body, text=title, bg=P['card'], fg=P['dim'],
+                           font=("Consolas", 7, "bold"), anchor="w")
+        title_l.pack(fill="x")
         val = tk.Label(body, text="—", bg=P['card'], fg=color,
                        font=("Consolas", 16, "bold"), anchor="w")
         val.pack(fill="x")
         sub_l = tk.Label(body, text=sub, bg=P['card'], fg=P['faint'],
                          font=("Consolas", 7), anchor="w")
         sub_l.pack(fill="x")
+        # One live tooltip for the whole tile — resolves the current value +
+        # sub-label at hover time so it never goes stale.
+        _card_tip = (lambda t=title, v=val, s=sub_l:
+                     f"{t}\n{'─' * 24}\n"
+                     f"Value: {v.cget('text')}\n"
+                     f"{s.cget('text')}")
+        for _w in (title_l, val, sub_l, card, body):
+            _add_tooltip(_w, _card_tip)
         # ASF-style labeled bar: a 3px fill strip along the card bottom that
         # turns the flat counter into a gauge (fraction of what it tracks).
         bar_bg = tk.Frame(card, bg=P['panel_hi'], height=3)
@@ -28716,8 +29437,15 @@ class GNATracerGUI:
             "The dossier panel on the right shows\n"
             "every known field for the clicked IP,\n"
             "process or device.")
-        tk.Label(rail, text="I\nN\nS\nP\nE\nC\nT", bg=P['panel'], fg=P['faint'],
-                 font=("Consolas", 6, "bold"), justify="center").pack(pady=8)
+        rail_lbl = tk.Label(rail, text="I\nN\nS\nP\nE\nC\nT", bg=P['panel'],
+                            fg=P['faint'], font=("Consolas", 6, "bold"),
+                            justify="center")
+        rail_lbl.pack(pady=8)
+        _add_tooltip(rail_lbl,
+            "Inspector dock\n─────────────────────\n"
+            "The side-panel dossier — every\n"
+            "known field for the clicked IP,\n"
+            "process or device.")
         # Body: header + entity line + scrollable dossier text.
         body = tk.Frame(dock, bg=P['panel'], width=302,
                         highlightthickness=1, highlightbackground=P['border'])
@@ -28729,8 +29457,14 @@ class GNATracerGUI:
         ihdr.pack_propagate(False)
         trow = tk.Frame(ihdr, bg=P['panel_hi'])
         trow.pack(fill="x", padx=8, pady=(6, 0))
-        tk.Label(trow, text="◈ INSPECTOR", bg=P['panel_hi'], fg=P['accent'],
-                 font=("Consolas", 9, "bold")).pack(side="left")
+        insp_lbl = tk.Label(trow, text="◈ INSPECTOR", bg=P['panel_hi'],
+                            fg=P['accent'], font=("Consolas", 9, "bold"))
+        insp_lbl.pack(side="left")
+        _add_tooltip(insp_lbl,
+            "Inspector\n─────────────────────\n"
+            "Dossier listing every field the\n"
+            "monitor knows about the selected\n"
+            "IP / process / device.")
         self._inspector_title = tk.Label(trow, text="—", bg=P['panel_hi'],
                                          fg=P['warn'], font=("Consolas", 7, "bold"))
         self._inspector_title.pack(side="right")
@@ -28743,6 +29477,11 @@ class GNATracerGUI:
                                        bg=P['panel_hi'], fg=P['dim'],
                                        font=("Consolas", 7), anchor="w")
         self._inspector_sub.pack(fill="x", padx=9)
+        _add_tooltip(self._inspector_sub,
+            "Inspector target\n─────────────────────\n"
+            "Which entity the dossier shows.\n"
+            "Click a connection row, map dot,\n"
+            "process or device to retarget.")
         self._inspector_text = scrolledtext.ScrolledText(
             body, bg=P['textbox'], fg=P['text'], font=("Consolas", 8),
             insertbackground=P['text'], state="disabled", wrap="word",
@@ -31988,7 +32727,8 @@ class GNATracerGUI:
         # has moved: same immutable snapshot, same view, same search, same
         # trace progress. Dots/lines are re-created from scratch otherwise,
         # ~200 canvas items several times a second.
-        _msig = (self._ver(data, 'conn'), round(self._map_zoom, 3),
+        _msig = (self._ver(data, 'conn'), self._ver(data, 'sig'),
+                 round(self._map_zoom, 3),
                  round(self._map_center_lat, 4), round(self._map_center_lon, 4),
                  self._map_w, self._map_h,
                  self._map_search_var.get() if self._map_search_var else '',
@@ -32094,6 +32834,7 @@ class GNATracerGUI:
             'ip_conn_count': ip_conn_count,
             'ip_vpn': ip_vpn,
             'local_geo': local_geo,
+            'spectrum': data.get('spectrum') or {},
         }
         # Toolbar census — dots plotted / VPN-flagged / critical-risk.
         if self._map_count_lbl is not None:
@@ -32152,21 +32893,34 @@ class GNATracerGUI:
         # Draw "You are here" marker
         if has_local and -20 <= local_x <= w + 20 and -20 <= local_y <= h + 20:
             # Pulsing ring
+            r_ring = 12 * _MAP_MARKER_SCALE
+            r_dot = 7 * _MAP_MARKER_SCALE
             self._map_canvas.create_oval(
-                local_x - 12, local_y - 12, local_x + 12, local_y + 12,
+                local_x - r_ring, local_y - r_ring,
+                local_x + r_ring, local_y + r_ring,
                 outline="#00d4ff", width=2, tags="dot")
             self._map_canvas.create_oval(
-                local_x - 7, local_y - 7, local_x + 7, local_y + 7,
+                local_x - r_dot, local_y - r_dot,
+                local_x + r_dot, local_y + r_dot,
                 fill="#00d4ff", outline="#ffffff", width=2, tags="dot")
             # Label — always shown (it's one marker, not clutter-prone), but
             # still scales gently with zoom rather than a fixed size.
             loc_str = f"{local_geo.get('city', '?')}, {local_geo.get('country_code', '?')}"
             you_sz = self._map_label_size(z, max_size=15, floor=10, z_min=0)
             city_sz = self._map_label_size(z, max_size=13, floor=9, z_min=0)
-            self._map_chip_label(local_x + 18, local_y - you_sz, "📍 YOU",
+            _you_tip = (
+                "Your location\n─────────────────────\n"
+                f"Public IP: {local_geo.get('ip', '?')}\n"
+                f"{loc_str}\n"
+                f"{local_geo.get('org') or local_geo.get('isp') or ''}\n"
+                "GeoIP estimate — city-level accuracy.\n"
+                "All connection arcs start here.")
+            t_you = self._map_chip_label(local_x + 18, local_y - you_sz, "📍 YOU",
                                  "#33e0ff", you_sz, anchor="w")
-            self._map_chip_label(local_x + 18, local_y + city_sz, loc_str,
+            t_city = self._map_chip_label(local_x + 18, local_y + city_sz, loc_str,
                                  "#aaddff", city_sz, anchor="w")
+            self._map_bind_tip(t_you, _you_tip)
+            self._map_bind_tip(t_city, _you_tip)
             # Public IP + carrier — every local_geo field gets a visual home
             _you_meta = '  '.join(x for x in (
                 str(local_geo.get('ip') or ''),
@@ -32174,9 +32928,10 @@ class GNATracerGUI:
                 if has_local else '',
                 local_geo.get('org') or local_geo.get('isp') or '') if x)
             if _you_meta:
-                self._map_chip_label(local_x + 18,
+                t_meta = self._map_chip_label(local_x + 18,
                                      local_y + city_sz * 2 + 4, _you_meta,
                                      "#6a8aaa", city_sz - 1, anchor="w")
+                self._map_bind_tip(t_meta, _you_tip)
         # Draw connection lines from local to remote
         if z >= 2 and all_points and has_local:
             for pt in all_points:
@@ -32280,17 +33035,22 @@ class GNATracerGUI:
                 fill_color, outline_color = "#44cc44", "#66ff66"
             if ip in getattr(self, '_watchlist_ips', set()):
                 outline_color = "#00ffff"
-            radius = min(8, max(3, 3 + ip_conn_count.get(ip, 1)))
+            radius = (min(8, max(3, 3 + ip_conn_count.get(ip, 1)))
+                      * _MAP_MARKER_SCALE)
             if ip == self._selected_ip:
                 # Selection ring for the endpoint chosen from a click or the
                 # "Show on map" context action.
+                sr = 6 * _MAP_MARKER_SCALE
                 self._map_canvas.create_oval(
-                    x - radius - 6, y - radius - 6, x + radius + 6, y + radius + 6,
+                    x - radius - sr, y - radius - sr,
+                    x + radius + sr, y + radius + sr,
                     outline="#ffffff", width=2, tags="dot")
                 outline_color = "#ffffff"
             # Draw a subtle glow/halo behind the dot for visibility on map tiles
+            hr = 2 * _MAP_MARKER_SCALE
             self._map_canvas.create_oval(
-                x - radius - 2, y - radius - 2, x + radius + 2, y + radius + 2,
+                x - radius - hr, y - radius - hr,
+                x + radius + hr, y + radius + hr,
                 fill="", outline="#000000", width=1, stipple="gray50", tags="dot")
             dot = self._map_canvas.create_oval(
                 x - radius, y - radius, x + radius, y + radius,
@@ -32323,8 +33083,11 @@ class GNATracerGUI:
             if uncluttered:
                 fsz = self._map_label_size(z, max_size=21)
                 if fsz:
-                    self._map_chip_label(x + radius + 8, y, ip, "#ffe066",
-                                         fsz, anchor="w")
+                    t_ip = self._map_chip_label(x + radius + 8, y, ip, "#ffe066",
+                                                fsz, anchor="w")
+                    self._map_canvas.tag_bind(t_ip, "<Enter>",
+                        lambda e, i=ip, inf=info: self._on_map_dot_enter(e, i, inf))
+                    self._map_canvas.tag_bind(t_ip, "<Leave>", self._on_map_dot_leave)
             # VPN/proxy disclaimer — only on isolated dots; a clustered VPN
             # exit is already unambiguous from its magenta color plus the
             # legend, and the full warning is always one hover away.
@@ -32333,8 +33096,11 @@ class GNATracerGUI:
                 if fsz:
                     prov = vpn_rep.get('provider') or ''
                     disclaimer = f"⚠ {prov} EXIT" if prov else "⚠ VPN EXIT"
-                    self._map_chip_label(x, y - radius - (fsz + 6), disclaimer,
-                                         "#ff99ff", fsz)
+                    t_vpn = self._map_chip_label(x, y - radius - (fsz + 6),
+                                                 disclaimer, "#ff99ff", fsz)
+                    self._map_canvas.tag_bind(t_vpn, "<Enter>",
+                        lambda e, i=ip, inf=info: self._on_map_dot_enter(e, i, inf))
+                    self._map_canvas.tag_bind(t_vpn, "<Leave>", self._on_map_dot_leave)
             # Cluster badge — one compact "×N" marker per shared cell,
             # replacing what used to be N stacked, overlapping labels. Always
             # shown (no zoom gate) since it's already compact, but still
@@ -32343,8 +33109,14 @@ class GNATracerGUI:
                 cluster_labeled.add(key)
                 fsz = self._map_label_size(z, max_size=18, floor=10, z_min=0)
                 ax, ay = cluster_anchor.get(key, (x, y))
-                self._map_chip_label(ax + radius + fsz + 4, ay - radius - fsz,
-                                     f"×{cluster_n}", "#ffe066", fsz)
+                t_cl = self._map_chip_label(ax + radius + fsz + 4, ay - radius - fsz,
+                                            f"×{cluster_n}", "#ffe066", fsz)
+                self._map_bind_tip(t_cl,
+                    f"{cluster_n} connections share this\n"
+                    "approximate location (GeoIP is\n"
+                    "city-granularity). Zoom in to\n"
+                    "spread the dots, hover each for\n"
+                    "per-connection detail.")
 
     @staticmethod
     def _map_label_size(z, max_size, floor=8, z_min=3.0, z_full=7.5):
@@ -32355,7 +33127,8 @@ class GNATracerGUI:
         if z < z_min:
             return 0
         t = 1.0 if z_full <= z_min else max(0.0, min(1.0, (z - z_min) / (z_full - z_min)))
-        return max(floor, round(floor + t * (max_size - floor)))
+        return max(1, round(max(floor, round(floor + t * (max_size - floor)))
+                            * _MAP_MARKER_SCALE))
 
     def _map_chip_label(self, cx, cy, text, fg, font_size, anchor="center"):
         """Draw text on an opaque dark chip, sized to fit — used for every
@@ -32374,6 +33147,13 @@ class GNATracerGUI:
             fill="#050508", outline=fg, width=2, tags="dot")
         self._map_canvas.tag_raise(t, bg)
         return t
+
+    def _map_bind_tip(self, item, text):
+        """Hover description for a canvas item (map chip labels) — uses the
+        same delayed tooltip as the connection dots."""
+        self._map_canvas.tag_bind(
+            item, "<Enter>", lambda e, t=text: self._show_tooltip(e, t))
+        self._map_canvas.tag_bind(item, "<Leave>", self._on_map_dot_leave)
 
     def _refresh_actions(self, data):
         if self._render_skip('act', (self._ver(data, 'act'),
@@ -34242,8 +35022,13 @@ class GNATracerGUI:
         # Live refresh rate control
         w.insert("end", "  LIVE REFRESH RATE: ", "subheader")
         refresh_frame = tk.Frame(w, bg="#12121a")
-        tk.Label(refresh_frame, text="GUI refresh (ms):", bg="#12121a", fg="#a0a0b0",
-                 font=("Consolas", 9)).pack(side="left", padx=4)
+        gref_lbl = tk.Label(refresh_frame, text="GUI refresh (ms):",
+                            bg="#12121a", fg="#a0a0b0", font=("Consolas", 9))
+        gref_lbl.pack(side="left", padx=4)
+        _add_tooltip(gref_lbl,
+            "GUI refresh rate\n─────────────────────\n"
+            "Milliseconds between interface\n"
+            "repaints — type a value and Apply.")
         refresh_entry = tk.Entry(refresh_frame, width=6, font=("Consolas", 9),
                                  bg="#1a1a2e", fg="#00d4ff", bd=0,
                                  insertbackground="#c0c0c0")
@@ -34261,8 +35046,15 @@ class GNATracerGUI:
         tk.Button(refresh_frame, text="Apply", bg="#333355", fg="#00d4ff",
                   font=("Consolas", 8, "bold"), bd=0, padx=6,
                   command=_apply_refresh_rate).pack(side="left", padx=4)
-        tk.Label(refresh_frame, text="(50-10000ms · lower=faster · 250=recommended)",
-                 bg="#12121a", fg="#7a7a8a", font=("Consolas", 7)).pack(side="left", padx=4)
+        gref_hint = tk.Label(refresh_frame,
+            text="(50-10000ms · lower=faster · 250=recommended)",
+            bg="#12121a", fg="#7a7a8a", font=("Consolas", 7))
+        gref_hint.pack(side="left", padx=4)
+        _add_tooltip(gref_hint,
+            "Refresh-rate guidance\n─────────────────────\n"
+            "Allowed range 50–10000 ms.\n"
+            "Lower = snappier but more CPU.\n"
+            "250 ms is the sweet spot.")
         w.window_create("end", window=refresh_frame)
         w.insert("end", "\n\n")
         for key in sorted(CONFIG.keys()):
@@ -37664,6 +38456,41 @@ class GNATracerGUI:
                         lines.append(f"  {_mv_compact(_it)}")
                     else:
                         lines.append(f"  {_it}")
+        # ── SPECTRUM / RF SIGNAL INTELLIGENCE — the full emitter
+        # registry verbatim: every non-IP signal source the host can
+        # hear, across all 11 media, plus coverage, fixes, sensors.
+        _sp = data.get('spectrum') or {}
+        if _sp:
+            lines.append("")
+            lines.append("=" * 100)
+            lines.append(f"── SPECTRUM / RF SIGNAL INTELLIGENCE "
+                         f"({_sp.get('emitters_total', 0)} emitters, "
+                         f"{_sp.get('emitters_active', 0)} active) ──")
+            lines.append("=" * 100)
+            for _m, _n in sorted((_sp.get('per_medium') or {}).items()):
+                lines.append(f"  {_m}: {_n}")
+            for _em in (_sp.get('emitters') or []):
+                lines.append(f"  [{_em.get('medium','?')}] "
+                             f"{_em.get('address','?')} "
+                             f"{_em.get('name') or ''} "
+                             f"status={_em.get('status','?')} "
+                             f"rssi={_em.get('rssi_dbm','n/a')}dBm "
+                             f"dist={_em.get('dist_m','n/a')}m "
+                             f"seen x{_em.get('seen_count',0)} "
+                             f"sensors={','.join(_em.get('sensors') or ['local'])}")
+                _ex = _em.get('extra') or {}
+                for _k, _v in _ex.items():
+                    lines.append(f"      {_k} = {_v}")
+            _fixes = _sp.get('fixes') or {}
+            if _fixes:
+                lines.append("── TRILATERATION FIXES ──")
+                for _k, _f in _fixes.items():
+                    lines.append(f"  {_k}: {_mv_compact(_f)}")
+            _evs = data.get('spectrum_events') or []
+            if _evs:
+                lines.append(f"── SPECTRUM EVENTS ({len(_evs)}) ──")
+                for _e in _evs:
+                    lines.append(f"  {_mv_compact(_e) if isinstance(_e, dict) else _e}")
         # Full terminal output (100%)
         lines.append("")
         lines.append("=" * 100)
@@ -41137,7 +41964,10 @@ class MedianBoxMonitor:
         # registry on its own cadence (rf_l2_flush_interval).
         if has_ether:
             try:
-                _l2w = self._l2_wire
+                _l2w = getattr(self, '_l2_wire', None)
+                if _l2w is None:
+                    _l2w = {}
+                    self._l2_wire = _l2w
                 _sm = _eth.src
                 _r = _l2w.get(_sm)
                 if _r is None and len(_l2w) < int(
@@ -41942,7 +42772,8 @@ class MedianBoxMonitor:
                     # emitter; the op names its role (who-has requester /
                     # is-at claimer) and psrc is the L3 identity it claims
                     # even when it never sends us a single IP packet.
-                    _l2rec = self._l2_wire.get(_a.hwsrc)
+                    _l2w = getattr(self, '_l2_wire', None)
+                    _l2rec = _l2w.get(_a.hwsrc) if _l2w else None
                     if _l2rec is not None:
                         if len(_l2rec['svc']) < 12:
                             _l2rec['svc'].add('arp-is-at'
@@ -43421,7 +44252,8 @@ class MedianBoxMonitor:
                     _tg = str(pkt[ICMPv6ND_NA].tgt)
                     # WIRETALK — NA speaker: neighbor role + the v6
                     # target it claims as its own identity.
-                    _l2rec = self._l2_wire.get(_eth.src)
+                    _l2w = getattr(self, '_l2_wire', None)
+                    _l2rec = _l2w.get(_eth.src) if _l2w else None
                     if _l2rec is not None:
                         if len(_l2rec['svc']) < 12:
                             _l2rec['svc'].add('ipv6-nd-neighbor-adv')
@@ -43452,7 +44284,8 @@ class MedianBoxMonitor:
                                 30.0)
                 if ICMPv6ND_RA and pkt.haslayer(ICMPv6ND_RA):
                     # WIRETALK — RA speaker: self-declared IPv6 router.
-                    _l2rec = self._l2_wire.get(_eth.src)
+                    _l2w = getattr(self, '_l2_wire', None)
+                    _l2rec = _l2w.get(_eth.src) if _l2w else None
                     if _l2rec is not None:
                         if len(_l2rec['svc']) < 12:
                             _l2rec['svc'].add('ipv6-nd-router-adv')
@@ -44025,7 +44858,10 @@ class MedianBoxMonitor:
         time.sleep(3)
         while not self.stop.is_set():
             try:
-                self.spectrum.tick(wire_talkers=self._l2_wire)
+                with self.lock:
+                    _devs = dict(self.devices)
+                self.spectrum.tick(wire_talkers=self._l2_wire,
+                                   lan_devices=_devs)
                 for ev in self.spectrum.drain_events():
                     sev = str(ev.get('severity', 'INFO')).upper()
                     detail = ev.get('detail', '')
