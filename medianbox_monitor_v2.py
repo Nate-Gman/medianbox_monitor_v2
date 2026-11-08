@@ -1141,30 +1141,61 @@ def _parse_proxy_hdr(data: bytes):
     return []
 
 
+_REAL_IP_HEADERS = (
+    # Ordered by trust: single-purpose client-address headers first. A
+    # request carrying any of these has ALREADY crossed a relay chain
+    # (CDN edge, reverse proxy, VPN egress) that stamped the original
+    # client — the first/only address is the real pre-relay client.
+    b'cf-connecting-ip:',         # Cloudflare edge -> origin
+    b'true-client-ip:',           # Akamai / Cloudflare Enterprise
+    b'x-real-ip:',                # nginx relay
+    b'x-forwarded-for:',          # generic proxy chain
+    b'forwarded:',                # RFC 7239
+    b'fastly-client-ip:',         # Fastly edge
+    b'x-cluster-client-ip:',      # LB clusters
+    b'x-client-ip:',              # generic LB
+    b'client-ip:',                # generic LB
+    b'x-originating-ip:',         # IIS / WAF class
+    b'x-remote-ip:',              # generic
+    b'x-remote-addr:',            # generic
+    b'x-azure-clientip:',         # Azure Front Door
+    b'x-appengine-user-ip:',      # Google AppEngine
+    b'x-ms-forwarded-client-ip:', # Azure Application Gateway
+    b'ali-cdn-real-ip:',          # Alibaba Cloud CDN
+    b'x-tencentedge-client-ip:',  # Tencent EdgeOne
+    b'x-via:',                    # Squid chain with embedded IP
+)
+
+
 def _parse_http_xff(data: bytes):
-    """X-Forwarded-For / Forwarded header — a request carrying these
-    has ALREADY crossed a relay chain that stamped the original
-    client. First address in the list is the real pre-relay client.
-    """
+    """Real-client headers stamped by a relay upstream — X-Forwarded-For,
+    Forwarded, CF-Connecting-IP, True-Client-IP, X-Real-IP and the rest of
+    the relay-to-origin header family. The first address in the value is
+    the real pre-relay client."""
     try:
         low = data.lower()
-        for mk in (b'x-forwarded-for:', b'forwarded:'):
+        for mk in _REAL_IP_HEADERS:
             i = low.find(mk)
             if i < 0:
                 continue
             j = low.find(b'\r\n', i)
             v = data[i + len(mk):j if j > 0 else i + len(mk) + 200]
             v = v.decode('ascii', 'replace')
-            if mk.startswith(b'forwarded'):
+            if mk == b'forwarded:':
                 for part in v.split(';'):
                     part = part.strip().lower()
                     if part.startswith('for='):
                         v = part[4:].strip('"[] ')
                         break
-            return v.split(',')[0].strip()
+            elif mk == b'x-via:':
+                m = re.search(r'([0-9]{1,3}(?:\.[0-9]{1,3}){3}|[0-9a-fA-F:]{3,45})', v)
+                v = m.group(1) if m else ''
+            return v.split(',')[0].strip().strip('"[] ')
     except Exception:
         pass
     return ''
+
+
 
 
 def _parse_sip_leak(data: bytes):
@@ -1520,6 +1551,86 @@ def _parse_nbns(data: bytes):
     except Exception:
         pass
     return out
+
+
+def _dns_read_name(data: bytes, off: int):
+    """Decompress one DNS name at offset; returns (name, end_offset).
+    end_offset is 0 on a malformed run so callers can bail cleanly."""
+    labels, jumped, end, guard = [], False, off, 0
+    while off < len(data) and guard < 64:
+        guard += 1
+        ln = data[off]
+        if ln == 0:
+            if not jumped:
+                end = off + 1
+            break
+        if ln & 0xC0 == 0xC0:
+            if off + 1 >= len(data):
+                return '', 0
+            ptr = ((ln & 0x3F) << 8) | data[off + 1]
+            if not jumped:
+                end = off + 2
+            off = ptr
+            jumped = True
+            continue
+        off += 1
+        if off + ln > len(data):
+            return '', 0
+        labels.append(data[off:off + ln].decode('utf-8', 'replace'))
+        off += ln
+        if not jumped:
+            end = off
+    return '.'.join(labels), end
+
+
+def _mdns_ptr_names(data: bytes) -> list:
+    """Extract PTR target names from an mDNS response — the *.local
+    hostnames a device publishes about itself."""
+    names = []
+    try:
+        if len(data) < 12 or not (data[2] & 0x80):
+            return names
+        qd, an = struct.unpack('>HH', data[4:8])
+        off = 12
+        for _ in range(min(qd, 16)):
+            _, e = _dns_read_name(data, off)
+            if not e:
+                return names
+            off = e + 4
+        for _ in range(min(an, 64)):
+            _, e = _dns_read_name(data, off)
+            if not e or e + 10 > len(data):
+                break
+            rtype, _cls, _ttl, rdlen = struct.unpack('>HHIH', data[e:e + 10])
+            roff = e + 10
+            if rtype == 12 and roff + rdlen <= len(data):
+                nm, _ = _dns_read_name(data, roff)
+                nm = nm.rstrip('.')
+                if nm and nm not in names:
+                    names.append(nm)
+            off = roff + rdlen
+    except Exception:
+        pass
+    return names
+
+
+def _mdns_ptr(ip: str, timeout: float = 0.8) -> list:
+    """Unicast mDNS reverse-PTR (QU bit set) — the name a Bonjour/Avahi
+    host, printer or IoT device claims for itself on the LAN."""
+    try:
+        parts = ip.split('.')
+        if len(parts) != 4:
+            return []
+        rev = '.'.join(reversed(parts)) + '.in-addr.arpa'
+    except Exception:
+        return []
+    pkt = _dns_wire_query(rev, 12, 0x8001, qid=0)
+    names = []
+    for resp in MultiVerifier._udp_exchange(ip, 5353, pkt, timeout=timeout, reads=3):
+        for n in _mdns_ptr_names(resp):
+            if n not in names:
+                names.append(n)
+    return names[:8]
 
 
 def _snmp_v1_get() -> bytes:
@@ -2102,6 +2213,8 @@ CONFIG = {
     'pipeline_workers': 4,
     'pipeline_queue_size': 10000,
     'dashboard_password': '',
+        'dashboard_cert': '',
+        'dashboard_key': '',
     'geoip_db_path': '',
     # --- Spectrum / non-IP signal intelligence ---
     # Tracks every RF emitter the machine can perceive — Wi-Fi beacons,
@@ -2126,6 +2239,72 @@ CONFIG = {
     'rf_l2_wire_max': 4096,          # max distinct src MACs tracked on the wire
     'rf_l2_active_s': 120,           # silent this long -> emitter drops to 'lost'
     'rf_l2_drop_s': 3600,            # silent this long -> table row pruned
+    # --- Out-of-band alerting (webhook / email) ---
+    'alert_webhook_url': '',         # Slack / Discord / generic JSON endpoint
+    'alert_webhook_min_severity': 'CRITICAL',
+    'alert_rate_per_min': 6,         # hard cap on outbound alerts per minute
+    'alert_dedupe_s': 300,           # identical alert suppressed for this long
+    'alert_email_to': '',
+    'alert_email_from': '',
+    'alert_smtp_host': '',
+    'alert_smtp_port': 587,
+    'alert_smtp_user': '',
+    'alert_smtp_password': '',
+        'alert_ntfy_topic': '',
+        'alert_ntfy_url': '',
+        'alert_ntfy_token': '',
+    # --- SIEM HTTP connectors (siem_output: splunk_hec | elastic) ---
+    'siem_url': '',
+    'siem_token': '',
+        'siem_workspace_id': '',
+        'siem_key': '',
+        'siem_log_type': 'MedianBox',
+    # --- Automated response (off | dry_run | suspend) ---
+    # 'suspend' freezes the offending process (reversible) — never kills,
+    # never touches the protected-process list, only at/above the min score.
+    'auto_response': 'off',
+    'auto_response_min_score': 80,
+    # --- Persistence ---
+    'ml_baseline_file': 'medianbox_baseline.json',
+    'ml_baseline_save_interval': 300,
+    'gnat_record': True,
+    'db_persist_connections': True,
+        'db_persist_emitters': True,
+    'db_persist_interval_scans': 20,
+    # --- Code-signing verification (Windows Authenticode) ---
+    'authenticode_enabled': True,
+        'signature_scan': True,
+        'signatures_file': '',
+    # --- Attribution (RDAP owner lookup for otherwise unnamed peers) ---
+    'attribution_rdap': True,
+    # Fetch the TLS certificate of public peers we are already connected to
+    # (TLS ports only, rate-limited) to name endpoints DNS/rDNS cannot.
+    'attribution_tls_probe': True,
+    # Provider-published address ranges (AWS/GCP/Cloudflare/GitHub/Fastly/
+    # Oracle) fetched at most once per TTL and cached on disk — names the
+    # exact service/region behind an otherwise generic "Amazon AWS" owner.
+    'attribution_provider_ranges': True,
+    'attribution_provider_ranges_file': 'medianbox_provider_ranges.json',
+    'attribution_provider_ranges_ttl_s': 86400,
+        'threat_intel_feeds': True,
+        'threat_intel_file': '',
+        'threat_intel_ttl_s': 86400,
+    # Team Cymru IP->ASN DNS (pure-Python TXT query) as an owner source when
+    # GeoIP and RDAP are both silent.
+    'attribution_cymru': True,
+    # Remember which process owned every socket so TIME_WAIT sockets (which
+    # the OS reports with PID 0) can be traced back to their owner.
+    'attribution_owner_history': True,
+    # Passive-DNS reverse-IP — names the sites hosted on an IP when rDNS,
+    # registry and TLS data are all silent.
+    'attribution_passive_dns': True,
+    # Self-naming probes (NBNS/SNMP/NTP/SSDP/SSRP, mDNS on LAN) — the
+    # endpoint states its own identity when every other source is silent.
+    'attribution_ident_probe': True,
+    # Pivot a trace at the operator when the endpoint is VPN/proxy/Tor/CDN/
+    # cloud (registry, security.txt, footprint, Tor relay family).
+    'trace_operator_pivot': True,
+    'canary_port': 0,
 }
 
 EMOJI = {
@@ -2188,7 +2367,7 @@ CONFIG_SCHEMA = {
     'dll_scan_interval':          {'type': (int, float), 'min': 5},
     'escalation_window':          {'type': (int, float), 'min': 10},
     'escalation_multiplier':      {'type': (int, float), 'min': 1.0, 'max': 10.0},
-    'siem_output':                {'type': (str, type(None)), 'choices': {None, 'json', 'cef', 'syslog'}},
+    'siem_output':                {'type': (str, type(None)), 'choices': {None, 'json', 'cef', 'syslog', 'splunk_hec', 'elastic', 'sentinel'}},
     'siem_host':                  {'type': str},
     'siem_port':                  {'type': int, 'min': 1, 'max': 65535},
     'dashboard_enabled':          {'type': bool},
@@ -2199,6 +2378,8 @@ CONFIG_SCHEMA = {
     'pipeline_workers':           {'type': int, 'min': 1, 'max': 16},
     'pipeline_queue_size':        {'type': int, 'min': 100},
     'dashboard_password':         {'type': str},
+        'dashboard_cert':             {'type': str},
+        'dashboard_key':              {'type': str},
     'geoip_db_path':              {'type': str},
     'rf_monitor_enabled':         {'type': bool},
     'rf_wifi_interval':           {'type': (int, float), 'min': 5, 'max': 600},
@@ -2219,6 +2400,49 @@ CONFIG_SCHEMA = {
     'rf_l2_wire_max':             {'type': int, 'min': 256, 'max': 65536},
     'rf_l2_active_s':             {'type': (int, float), 'min': 30, 'max': 3600},
     'rf_l2_drop_s':               {'type': (int, float), 'min': 300, 'max': 86400},
+    'alert_webhook_url':          {'type': str},
+    'alert_webhook_min_severity': {'type': str, 'choices': {'INFO', 'WARNING', 'CRITICAL'}},
+    'alert_rate_per_min':         {'type': int, 'min': 1, 'max': 600},
+    'alert_dedupe_s':             {'type': (int, float), 'min': 0},
+    'alert_ntfy_topic':           {'type': str},
+        'alert_ntfy_url':             {'type': str},
+        'alert_ntfy_token':           {'type': str},
+        'alert_email_to':             {'type': str},
+    'alert_email_from':           {'type': str},
+    'alert_smtp_host':            {'type': str},
+    'alert_smtp_port':            {'type': int, 'min': 1, 'max': 65535},
+    'alert_smtp_user':            {'type': str},
+    'alert_smtp_password':        {'type': str},
+    'siem_url':                   {'type': str},
+    'siem_token':                 {'type': str},
+        'siem_workspace_id':          {'type': str},
+        'siem_key':                 {'type': str},
+        'siem_log_type':            {'type': str},
+    'auto_response':              {'type': str, 'choices': {'off', 'dry_run', 'suspend', 'quarantine'}},
+    'auto_response_min_score':    {'type': (int, float), 'min': 1},
+    'ml_baseline_file':           {'type': str},
+    'ml_baseline_save_interval':  {'type': (int, float), 'min': 10},
+    'gnat_record':                {'type': bool},
+    'db_persist_connections':     {'type': bool},
+        'db_persist_emitters':      {'type': bool},
+    'db_persist_interval_scans':  {'type': int, 'min': 1},
+    'authenticode_enabled':       {'type': bool},
+        'signature_scan':          {'type': bool},
+        'signatures_file':         {'type': str},
+    'attribution_rdap':           {'type': bool},
+    'attribution_tls_probe':      {'type': bool},
+    'attribution_provider_ranges': {'type': bool},
+    'attribution_provider_ranges_file': {'type': str},
+    'attribution_provider_ranges_ttl_s': {'type': (int, float), 'min': 60},
+        'threat_intel_feeds':           {'type': bool},
+        'threat_intel_file':            {'type': str},
+        'threat_intel_ttl_s':           {'type': (int, float), 'min': 60},
+    'attribution_cymru':          {'type': bool},
+    'attribution_owner_history':  {'type': bool},
+    'attribution_passive_dns':    {'type': bool},
+    'attribution_ident_probe':    {'type': bool},
+    'trace_operator_pivot':       {'type': bool},
+    'canary_port':                {'type': int},
 }
 
 
@@ -3018,7 +3242,7 @@ class StatisticalBaseline:
                 # when the raw deviation is too. A daemon idling at
                 # ~0% CPU / ~0 B/s otherwise earns CRITICAL z-scores
                 # from rounding noise (std≈0 → z explodes).
-                if delta < _ML_ABS_FLOOR.get(metric_name, 0.0):
+                if delta < self._ML_ABS_FLOOR.get(metric_name, 0.0):
                     continue
                 z = delta / std
                 if z > CONFIG['ml_zscore_threshold']:
@@ -3026,6 +3250,58 @@ class StatisticalBaseline:
                     total_z += z
         score = min(100, total_z * 10)
         return score, anomalies
+
+    _PERSIST_KEYS = ('conn_rate', 'dst_count', 'bytes_rate', 'cpu_mean', 'ts')
+
+    def save(self, path: str) -> bool:
+        """Persist learned baselines so a restart does not start cold."""
+        try:
+            with self.lock:
+                data = {name: {k: list(m[k]) for k in self._PERSIST_KEYS}
+                        for name, m in self.models.items() if m['ts']}
+            tmp = path + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump({'version': 1, 'saved': time.time(), 'models': data}, f)
+            os.replace(tmp, path)
+            return True
+        except Exception as exc:
+            _logger.debug("Baseline save failed: %s", exc)
+            return False
+
+    def load(self, path: str) -> int:
+        """Load a saved baseline, dropping samples older than the window.
+        Returns the number of process models restored."""
+        try:
+            with open(path, encoding='utf-8') as f:
+                blob = json.load(f)
+        except (OSError, ValueError):
+            return 0
+        cutoff = time.time() - CONFIG.get('ml_baseline_window', 86400)
+        restored = 0
+        with self.lock:
+            for name, m in (blob.get('models') or {}).items():
+                try:
+                    ts = m['ts']
+                    cols = {k: m[k] for k in self._PERSIST_KEYS}
+                    if any(len(cols[k]) != len(ts) for k in cols):
+                        continue
+                    model = self.models[name]
+                    for i, t in enumerate(ts):
+                        if t >= cutoff:
+                            for k in self._PERSIST_KEYS:
+                                model[k].append(float(cols[k][i]))
+                    restored += 1 if model['ts'] else 0
+                except (KeyError, TypeError, ValueError):
+                    continue
+        return restored
+
+    def start_autosave(self, path: str, stop_event: threading.Event,
+                       interval: float = 300.0) -> None:
+        def _loop():
+            while not stop_event.wait(interval):
+                self.save(path)
+            self.save(path)
+        threading.Thread(target=_loop, daemon=True, name="Baseline-Save").start()
 
 
 # ========================== JA4+ FINGERPRINTING ==========================
@@ -3426,11 +3702,27 @@ class USBMonitor:
         self._events: deque = deque(maxlen=500)
         self._baseline_set = False
 
-    def scan(self) -> list[dict]:
+    def _enum_usb(self) -> dict:
+        """Platform USB census -> {device_id: description}."""
         if not _IS_WINDOWS:
-            return []
-        events = []
-        current = set()
+            devs = {}
+            base = '/sys/bus/usb/devices'
+            try:
+                for entry in os.listdir(base):
+                    prod = os.path.join(base, entry, 'product')
+                    vid = os.path.join(base, entry, 'idVendor')
+                    try:
+                        desc = open(prod).read().strip() if \
+                            os.path.exists(prod) else ''
+                        ven = open(vid).read().strip() if \
+                            os.path.exists(vid) else '????'
+                        devs[entry] = desc or f'USB device {ven}'
+                    except Exception:
+                        devs[entry] = entry
+            except Exception:
+                pass
+            return devs
+        current = {}
         try:
             key_path = r"SYSTEM\CurrentControlSet\Enum\USB"
             with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path, 0, winreg.KEY_READ) as key:
@@ -3444,17 +3736,12 @@ class USBMonitor:
                                 try:
                                     instance = winreg.EnumKey(subkey, j)
                                     dev_id = f"{subkey_name}\\{instance}"
-                                    current.add(dev_id)
                                     try:
                                         with winreg.OpenKey(subkey, instance, 0, winreg.KEY_READ) as inst_key:
                                             desc, _ = winreg.QueryValueEx(inst_key, 'DeviceDesc')
                                     except Exception:
                                         desc = dev_id
-                                    if self._baseline_set and dev_id not in self._known_devices:
-                                        events.append({
-                                            'type': 'USB_NEW', 'device_id': dev_id,
-                                            'time': time.time(), 'severity': 'WARNING',
-                                            'detail': f"New USB device: {desc}"})
+                                    current[dev_id] = desc
                                     j += 1
                                 except OSError:
                                     break
@@ -3463,6 +3750,18 @@ class USBMonitor:
                         break
         except Exception as exc:
             _logger.debug("USB scan error: %s", exc)
+        return current
+
+    def scan(self) -> list[dict]:
+        events = []
+        current_map = self._enum_usb()
+        current = set(current_map)
+        if self._baseline_set:
+            for dev_id in current - self._known_devices:
+                events.append({
+                    'type': 'USB_NEW', 'device_id': dev_id,
+                    'time': time.time(), 'severity': 'WARNING',
+                    'detail': f"New USB device: {current_map[dev_id]}"})
         with self.lock:
             self._known_devices = current
             if not self._baseline_set:
@@ -3485,17 +3784,42 @@ class ScheduledTaskMonitor:
         self._events: deque = deque(maxlen=500)
         self._baseline_set = False
 
-    def scan(self) -> list[dict]:
-        if not _IS_WINDOWS:
-            return []
-        events = []
+    def _get_tasks(self) -> dict:
         current: dict[str, str] = {}
+        if not _IS_WINDOWS:
+            # cron spool + system cron dirs + systemd timers + user crontab
+            paths = ['/etc/crontab']
+            for d in ('/etc/cron.d', '/etc/cron.daily', '/etc/cron.hourly',
+                      '/etc/cron.weekly', '/etc/cron.monthly',
+                      '/var/spool/cron', '/var/spool/cron/crontabs'):
+                if os.path.isdir(d):
+                    for f in os.listdir(d):
+                        paths.append(os.path.join(d, f))
+            for p in paths:
+                try:
+                    data = open(p, 'rb').read()
+                    current['cron:' + p] = hashlib.md5(data).hexdigest()
+                except Exception:
+                    continue
+            try:
+                out = subprocess.run(
+                    ['systemctl', 'list-timers', '--all', '--no-legend',
+                     '--no-pager'],
+                    capture_output=True, text=True, timeout=10)
+                for line in out.stdout.split(chr(10)):
+                    unit = line.split()[-1] if line.split() else ''
+                    if unit.endswith('.timer'):
+                        current['timer:' + unit] = hashlib.md5(
+                            line.encode()).hexdigest()
+            except Exception:
+                pass
+            return current
         try:
             result = subprocess.run(
                 ['schtasks', '/query', '/fo', 'CSV', '/nh'],
                 capture_output=True, text=True, timeout=15,
                 creationflags=0x08000000)
-            for line in result.stdout.strip().split('\n'):
+            for line in result.stdout.strip().split(chr(10)):
                 parts = line.strip().strip('"').split('","')
                 if len(parts) >= 2:
                     task_name = parts[0].strip('"')
@@ -3503,6 +3827,12 @@ class ScheduledTaskMonitor:
                     current[task_name] = task_hash
         except Exception as exc:
             _logger.debug("Scheduled task scan error: %s", exc)
+        return current
+
+    def scan(self) -> list[dict]:
+        events = []
+        current = self._get_tasks()
+        if not current and self._baseline_set:
             return []
         if self._baseline_set:
             for name, h in current.items():
@@ -3660,15 +3990,55 @@ class WhoisLookup:
                 'end_address': data.get('endAddress', '?'),
                 'entities': [],
             }
-            for ent in data.get('entities', [])[:3]:
-                vcard = ent.get('vcardArray', [None, []])[1] if 'vcardArray' in ent else []
-                org_name = ''
-                for v in vcard:
-                    if v[0] == 'org':
-                        org_name = v[3] if len(v) > 3 else ''
-                    elif v[0] == 'fn':
-                        org_name = org_name or (v[3] if len(v) > 3 else '')
-                result['entities'].append({'name': org_name, 'roles': ent.get('roles', [])})
+            abuse = []
+            contacts = []
+
+            def _walk(ents, depth=0):
+                for ent in ents[:8]:
+                    vcard = ent.get('vcardArray', [None, []])[1] if 'vcardArray' in ent else []
+                    org_name = email = ''
+                    tels, emails, adr = [], [], ''
+                    for v in vcard:
+                        if v[0] == 'org':
+                            org_name = v[3] if len(v) > 3 else ''
+                        elif v[0] == 'fn':
+                            org_name = org_name or (v[3] if len(v) > 3 else '')
+                        elif v[0] == 'email' and len(v) > 3:
+                            email = str(v[3])
+                            emails.append(email)
+                        elif v[0] == 'tel' and len(v) > 3:
+                            tels.append(str(v[3]).replace('tel:', ''))
+                        elif v[0] == 'adr' and len(v) > 3:
+                            lab = (v[1] or {}).get('label') if isinstance(v[1], dict) else ''
+                            if lab:
+                                adr = str(lab).replace('\n', ', ')
+                            elif isinstance(v[3], list):
+                                adr = ', '.join(str(x) for x in v[3] if x)
+                    roles = ent.get('roles', [])
+                    if len(result['entities']) < 12:
+                        result['entities'].append({'name': org_name, 'roles': roles})
+                    if (emails or tels or adr) and len(contacts) < 12:
+                        contacts.append({'name': org_name, 'handle': ent.get('handle', ''),
+                                         'roles': roles, 'emails': emails[:3],
+                                         'phones': tels[:3], 'address': adr[:200]})
+                    if email and 'abuse' in roles and email not in abuse:
+                        abuse.append(email)
+                    if depth < 3:
+                        _walk(ent.get('entities', []), depth + 1)
+
+            _walk(data.get('entities', []))
+            result['abuse'] = abuse
+            result['contacts'] = contacts
+            result['status'] = list(data.get('status') or [])
+            result['remarks'] = [' '.join(d for d in (r.get('description') or []))[:240]
+                                 for r in (data.get('remarks') or [])[:4]]
+            result['port43'] = data.get('port43', '')
+            result['ip_version'] = data.get('ipVersion', '')
+            result['cidr'] = [f"{c.get('v4prefix') or c.get('v6prefix')}/{c.get('length')}"
+                              for c in data.get('cidr0_cidrs', []) if c.get('length') is not None]
+            result['events'] = {e.get('eventAction'): e.get('eventDate')
+                                for e in data.get('events', []) if e.get('eventAction')}
+            result['parent'] = data.get('parentHandle', '')
             with self.lock:
                 if len(self.cache) > 20000:
                     for k in list(self.cache)[:5000]:
@@ -3824,6 +4194,16 @@ class HostsFileMonitor:
             return ''
 
     def _get_dns_servers(self) -> set:
+        if not _IS_WINDOWS:
+            servers = set()
+            try:
+                for line in open('/etc/resolv.conf'):
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[0] == 'nameserver':
+                        servers.add(parts[1].strip())
+            except Exception:
+                pass
+            return servers
         try:
             out = subprocess.run(['ipconfig', '/all'], capture_output=True,
                                  text=True, timeout=10)
@@ -3868,13 +4248,30 @@ class HostsFileMonitor:
 class ServiceMonitor:
     """Detects new Windows services and services with suspicious binary paths."""
     SUSPICIOUS_PATHS = ('\\temp\\', '\\tmp\\', '\\downloads\\', '\\appdata\\',
-                        '\\desktop\\', '\\public\\', '\\programdata\\')
+                        '\\desktop\\', '\\public\\', '\\programdata\\', '/tmp/', '/dev/shm/', '/var/tmp/', '/run/user/')
 
     def __init__(self):
         self._baseline: set = set()
         self._first_run = True
 
     def _get_services(self) -> dict:
+        if not _IS_WINDOWS:
+            try:
+                out = subprocess.run(
+                    ['systemctl', 'list-units', '--type=service', '--all',
+                     '--no-legend', '--no-pager'],
+                    capture_output=True, text=True, timeout=15)
+                services = {}
+                for line in out.stdout.split(chr(10)):
+                    name = line.split()[0].strip() if line.split() else ''
+                    if name.endswith('.service'):
+                        name = name[:-8]
+                        desc = ' '.join(line.split()[4:]) if len(
+                            line.split()) > 4 else name
+                        services[name] = desc
+                return services
+            except Exception:
+                return {}
         try:
             out = subprocess.run(
                 ['sc', 'query', 'type=', 'service', 'state=', 'all'],
@@ -3891,6 +4288,15 @@ class ServiceMonitor:
             return {}
 
     def _get_service_binpath(self, svc: str) -> str:
+        if not _IS_WINDOWS:
+            try:
+                out = subprocess.run(
+                    ['systemctl', 'show', svc + '.service',
+                     '-p', 'ExecStart', '--value'],
+                    capture_output=True, text=True, timeout=5)
+                return out.stdout.strip()
+            except Exception:
+                return ''
         try:
             out = subprocess.run(['sc', 'qc', svc], capture_output=True,
                                  text=True, timeout=5)
@@ -3989,6 +4395,12 @@ class UserAccountMonitor:
         self._first_run = True
 
     def _get_users(self) -> set:
+        if not _IS_WINDOWS:
+            try:
+                return {l.split(':', 1)[0] for l in open('/etc/passwd')
+                        if ':' in l}
+            except Exception:
+                return set()
         try:
             out = subprocess.run(['net', 'user'], capture_output=True,
                                  text=True, timeout=10)
@@ -4007,6 +4419,20 @@ class UserAccountMonitor:
         return set()
 
     def _get_admins(self) -> set:
+        if not _IS_WINDOWS:
+            admins = set()
+            for grp in ('sudo', 'wheel', 'root', 'admin'):
+                try:
+                    out = subprocess.run(['getent', 'group', grp],
+                                         capture_output=True, text=True,
+                                         timeout=5)
+                    for line in out.stdout.split(chr(10)):
+                        members = line.split(':')[-1]
+                        admins.update(m.strip() for m in members.split(',')
+                                      if m.strip())
+                except Exception:
+                    pass
+            return admins
         try:
             out = subprocess.run(
                 ['net', 'localgroup', 'administrators'],
@@ -4170,6 +4596,226 @@ class DriverLoadMonitor:
         return results
 
 
+class ThreatIntelDB:
+    """Refreshable threat-intelligence lists. The built-in constants
+    (LOLBins, malware mutexes, exfil/C2 channels) are the baseline;
+    public feeds and an optional user file extend them so the monitor's
+    indicators stay current without a code release.
+
+    Feeds:
+      - LOLBAS official API (lolbas-project.github.io) -> living-off-the-
+        land binary names, refreshed from the project's own dataset.
+      - abuse.ch Feodo Tracker + SSLBL blocklists -> active C2
+        destination IPs observed in the wild in the last days.
+      - `threat_intel_file` (JSON, user-supplied) -> {"lolbins": [...],
+        "mutexes": {"name": "desc"}, "exfil_channels": [...]} merged
+        verbatim; never fetched, always honoured.
+
+    Fetched at most once per TTL on a background thread, cached on disk;
+    a failed fetch keeps the last good copy — the static baseline means
+    detection never regresses when a feed is unreachable."""
+
+    _LOLBAS_API = 'https://lolbas-project.github.io/api/lolbas.json'
+    _FEODO_C2 = 'https://feodotracker.abuse.ch/downloads/ipblocklist.json'
+    _SSLBL_C2 = 'https://sslbl.abuse.ch/blacklist/sslipblacklist.txt'
+
+    def __init__(self, cache_path: Optional[str] = None,
+                 user_file: Optional[str] = None,
+                 ttl_s: float = 86400.0):
+        self._cache_path = cache_path or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            'threat_intel_cache.json')
+        self._user_file = user_file
+        self._ttl_s = ttl_s
+        self._lock = threading.Lock()
+        self._lolbins: set = set()
+        self._mutexes: dict = {}
+        self._domains: set = set()
+        self._c2_ips: dict = {}
+        self._user_lolbins: set = set()
+        self._user_mutexes: dict = {}
+        self._user_domains: set = set()
+        self._user_c2: set = set()
+        self._fetched_at = 0.0
+        self._refreshing = False
+        self.sources: list = []
+        self._user_loaded = False
+        self._load_cache()
+
+    # ---- persistence -------------------------------------------------
+    def _load_cache(self) -> None:
+        try:
+            data = json.loads(open(self._cache_path, encoding='utf-8').read())
+            if time.time() - float(data.get('ts', 0)) <= self._ttl_s * 7:
+                self._lolbins = set(data.get('lolbins') or [])
+                self._mutexes = dict(data.get('mutexes') or {})
+                self._domains = set(data.get('domains') or [])
+                self._c2_ips = dict(data.get('c2_ips') or {})
+                self._fetched_at = float(data.get('ts', 0))
+        except Exception:
+            pass
+
+    def _save_cache(self) -> None:
+        try:
+            tmp = self._cache_path + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as fh:
+                json.dump({'ts': self._fetched_at,
+                           'lolbins': sorted(self._lolbins),
+                           'mutexes': self._mutexes,
+                           'domains': sorted(self._domains),
+                           'c2_ips': self._c2_ips}, fh)
+            os.replace(tmp, self._cache_path)
+        except Exception:
+            pass
+
+    def _cfg_user_file(self) -> Optional[str]:
+        try:
+            return self._user_file or CONFIG.get('threat_intel_file') or None
+        except Exception:
+            return self._user_file
+
+    def _load_user_file(self) -> None:
+        if self._user_loaded or not self._cfg_user_file():
+            return
+        self._user_loaded = True
+        try:
+            data = json.loads(open(self._cfg_user_file(), encoding='utf-8').read())
+            self._user_lolbins = {str(n).lower() for n in
+                                  data.get('lolbins') or []}
+            self._user_mutexes = {str(k): str(v) for k, v in
+                                  dict(data.get('mutexes') or {}).items()}
+            self._user_domains = {str(d).lower().lstrip('*.')
+                                  for d in data.get('exfil_channels') or []}
+            self._user_c2 = {str(ip).strip() for ip in
+                             data.get('c2_ips') or []}
+            self.sources.append(self._cfg_user_file())
+        except Exception:
+            pass
+
+    # ---- feeds -------------------------------------------------------
+    @staticmethod
+    def _fetch(url: str, limit: int = 4 * 1024 * 1024) -> bytes:
+        req = urllib.request.Request(
+            url, headers={'User-Agent': 'medianbox-monitor/2'})
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            return resp.read(limit)
+
+    def refresh(self, blocking: bool = False) -> None:
+        try:
+            if not CONFIG.get('threat_intel_feeds', True):
+                return
+        except Exception:
+            pass
+        if self._refreshing:
+            return
+        try:
+            ttl = float(CONFIG.get('threat_intel_ttl_s', self._ttl_s))
+        except Exception:
+            ttl = self._ttl_s
+        if time.time() - self._fetched_at < ttl:
+            return
+        if blocking:
+            self._do_refresh()
+            return
+        self._refreshing = True
+        threading.Thread(target=self._do_refresh, daemon=True).start()
+
+    def _do_refresh(self) -> None:
+        try:
+            got = False
+            try:
+                data = json.loads(self._fetch(self._LOLBAS_API))
+                names = set()
+                for entry in data if isinstance(data, list) else []:
+                    nm = str(entry.get('Name') or '').strip().lower()
+                    if nm:
+                        names.add(nm)
+                if names:
+                    with self._lock:
+                        self._lolbins |= names
+                    got = True
+                    if 'lolbas' not in self.sources:
+                        self.sources.append('lolbas')
+            except Exception:
+                pass
+            try:
+                ips = {}
+                for row in json.loads(self._fetch(self._FEODO_C2)):
+                    if not isinstance(row, dict):
+                        continue
+                    ip = str(row.get('ip_address') or '').strip()
+                    if ip:
+                        ips[ip] = 'Feodo C2: ' + str(
+                            row.get('malware') or 'botnet C2')
+                if ips:
+                    with self._lock:
+                        self._c2_ips.update(ips)
+                    got = True
+                    if 'feodo' not in self.sources:
+                        self.sources.append('feodo')
+            except Exception:
+                pass
+            try:
+                ips = {}
+                for line in self._fetch(self._SSLBL_C2).decode(
+                        'utf-8', 'replace').splitlines():
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    host = line.split(',')[0].split(':')[0].strip()
+                    if host:
+                        ips[host] = 'SSLBL C2: ' + (
+                            line.split(',')[-1].strip()
+                            if ',' in line else 'SSL blacklisted')
+                if ips:
+                    with self._lock:
+                        self._c2_ips.update(ips)
+                    got = True
+                    if 'sslbl' not in self.sources:
+                        self.sources.append('sslbl')
+            except Exception:
+                pass
+            except Exception:
+                pass
+            if got:
+                self._fetched_at = time.time()
+                self._save_cache()
+        finally:
+            self._refreshing = False
+
+    # ---- accessors (baseline constants ∪ fetched ∪ user file) --------
+    def lolbins(self) -> set:
+        self._load_user_file()
+        self.refresh()
+        return self._lolbins | self._user_lolbins
+
+    def mutexes(self) -> dict:
+        self._load_user_file()
+        self.refresh()
+        return dict(self._mutexes, **self._user_mutexes)
+
+    def exfil_channels(self) -> set:
+        self._load_user_file()
+        self.refresh()
+        return self._domains | self._user_domains
+
+
+    def c2_ips(self) -> dict:
+        self._load_user_file()
+        self.refresh()
+        out = dict(self._c2_ips)
+        for ip in self._user_c2:
+            out.setdefault(ip, 'user threat-intel file')
+        return out
+
+
+THREAT_INTEL = ThreatIntelDB()
+
+
+# Static baselines live next to their consumers; the accessors above add
+# fetched + user-supplied indicators on top, so a stale or unreachable
+# feed never reduces coverage.
+
 # ---- 16. Mutex / Named Object Scanner ----
 class MutexScanner:
     """Checks for known malware mutex names."""
@@ -4200,7 +4846,7 @@ class MutexScanner:
         kernel32.OpenMutexW.restype = ctypes.c_void_p
         kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
         kernel32.CloseHandle.restype = ctypes.wintypes.BOOL
-        for name, desc in self.KNOWN_MUTEXES.items():
+        for name, desc in dict(self.KNOWN_MUTEXES, **THREAT_INTEL.mutexes()).items():
             if name in self._found:
                 continue
             try:
@@ -4841,6 +5487,7 @@ class SignalRegistry:
         self.events: deque = deque(maxlen=800)
         self.seq = 0
         self._alert_cool: dict[str, float] = {}
+        self._event_sink = None
 
     # -- events ---------------------------------------------------------
     def _emit(self, etype, severity, detail, **kw):
@@ -4850,6 +5497,12 @@ class SignalRegistry:
         with self.lock:
             self.events.append(ev)
             self.seq += 1
+        sink = self._event_sink
+        if sink is not None:
+            try:
+                sink(ev)
+            except Exception:
+                pass
         return ev
 
     def _cool(self, key, secs):
@@ -6114,6 +6767,13 @@ class SpectrumHub:
             self._results['rfhw'] = self._process_rfhw(self.rfhw.scan())
         self._ingest_obs_file()
         self._solve_fixes()
+        db = getattr(self, 'db', None)
+        if db is not None and CONFIG.get('db_persist_emitters', True)                 and self._scan_cycle % max(1, int(CONFIG.get(
+                    'db_persist_interval_scans', 20))) == 0:
+            try:
+                db.save_emitters(self.registry.snapshot())
+            except Exception:
+                pass
         # approach alerts — emitters with a sustained rising RSSI inside the
         # alert radius get a proximity flag (someone physically closing in)
         thr_m = float(CONFIG.get('rf_approach_alert_m', 8.0))
@@ -21102,6 +21762,7 @@ class SIEMOutput:
         self.sock = None
         self._json_logger = None
         self._cef_logger = None
+        self._http = _HttpPoster('SIEM-HTTP')
         if CONFIG['siem_output'] == 'json':
             self._json_logger = self._make_file_logger('medianbox.siem_json', 'medianbox_siem.json')
         elif CONFIG['siem_output'] == 'cef':
@@ -21133,14 +21794,67 @@ class SIEMOutput:
             self._emit_cef(d)
         elif fmt == 'syslog':
             self._emit_syslog(d)
+        elif fmt in ('splunk_hec', 'elastic'):
+            self._emit_http(d, fmt)
+        elif fmt == 'sentinel':
+            self._emit_sentinel(d)
 
-    def _emit_json(self, d: Deduction):
-        record = {
+    @staticmethod
+    def _record(d: Deduction) -> dict:
+        return {
             'timestamp': datetime.datetime.fromtimestamp(d.timestamp).isoformat(),
             'severity': d.severity, 'category': d.category,
             'process': d.process_name, 'pid': d.pid,
             'message': d.message, 'evidence': d.evidence, 'score': d.score,
         }
+
+    def _emit_http(self, d: Deduction, fmt: str):
+        url, token = CONFIG.get('siem_url', ''), CONFIG.get('siem_token', '')
+        if not url:
+            return
+        rec = self._record(d)
+        if fmt == 'splunk_hec':
+            body = {'time': d.timestamp, 'host': socket.gethostname(),
+                    'sourcetype': 'medianbox:deduction', 'event': rec}
+            hdr = {'Authorization': f'Splunk {token}'} if token else {}
+        else:
+            body = {'@timestamp': rec['timestamp'], 'host': {'name': socket.gethostname()},
+                    'event': {'kind': 'alert', 'category': d.category,
+                              'severity': {'INFO': 3, 'WARNING': 6, 'CRITICAL': 9}.get(d.severity, 5)},
+                    'medianbox': rec}
+            hdr = {'Authorization': f'ApiKey {token}'} if token else {}
+        self._http.post(url, json.dumps(body).encode(), hdr)
+
+    def _emit_sentinel(self, d: Deduction):
+        """Azure Sentinel via the Log Analytics Data Collector API.
+        Needs siem_workspace_id + siem_key; rows land in the
+        <siem_log_type>_CL custom table."""
+        wid, key = CONFIG.get('siem_workspace_id', ''),             CONFIG.get('siem_key', '')
+        if not wid or not key:
+            return
+        try:
+            import base64 as _b64
+            import hashlib as _hl
+            import hmac as _hmac
+            from email.utils import formatdate as _fdate
+            body = json.dumps(self._record(d)).encode('utf-8')
+            date = _fdate(time.time(), usegmt=True)
+            sig_src = (f'POST\n{len(body)}\napplication/json\n'
+                       f'x-ms-date:{date}\n/api/logs')
+            sig = _b64.b64encode(_hmac.new(
+                _b64.b64decode(key), sig_src.encode('utf-8'),
+                _hl.sha256).digest()).decode()
+            url = (f'https://{wid}.ods.opinsights.azure.com'
+                   '/api/logs?api-version=2016-04-01')
+            hdr = {'Authorization': f'SharedKey {wid}:{sig}',
+                   'x-ms-date': date,
+                   'Log-Type': CONFIG.get('siem_log_type', 'MedianBox')}
+            self._http.post(url, body, hdr)
+        except Exception as exc:
+            _logger.debug('Sentinel emit failed: %s', exc)
+
+    def _emit_json(self, d: Deduction):
+        record = self._record(d)
         if self._json_logger:
             self._json_logger.info(json.dumps(record))
 
@@ -21166,6 +21880,5242 @@ class SIEMOutput:
                              (CONFIG['siem_host'], CONFIG['siem_port']))
         except Exception as exc:
             _logger.debug("SIEM syslog send failed: %s", exc)
+
+
+# ========================== OUT-OF-BAND DELIVERY ==========================
+class _HttpPoster:
+    """Bounded background JSON POST queue — never blocks the caller."""
+    def __init__(self, name: str):
+        self._name = name
+        self._q: "queue.Queue" = queue.Queue(maxsize=1000)
+        self._thread: Optional[threading.Thread] = None
+        self._lock = threading.Lock()
+        self.sent = 0
+        self.failed = 0
+
+    def post(self, url: str, body: bytes, headers: Optional[dict] = None) -> bool:
+        if not url.lower().startswith(('http://', 'https://')):
+            return False
+        with self._lock:
+            if self._thread is None:
+                self._thread = threading.Thread(target=self._loop, daemon=True, name=self._name)
+                self._thread.start()
+        try:
+            self._q.put_nowait((url, body, headers or {}))
+            return True
+        except queue.Full:
+            self.failed += 1
+            return False
+
+    def _loop(self):
+        while True:
+            url, body, headers = self._q.get()
+            for attempt in (0, 1):
+                try:
+                    req = urllib.request.Request(
+                        url, data=body, method='POST',
+                        headers={'Content-Type': 'application/json', **headers})
+                    with urllib.request.urlopen(req, timeout=10) as resp:
+                        resp.read(1024)
+                    self.sent += 1
+                    break
+                except Exception as exc:
+                    if attempt:
+                        self.failed += 1
+                        _logger.debug("%s delivery failed: %s", self._name, exc)
+                    else:
+                        time.sleep(2)
+
+
+class WebhookAlerter:
+    """Pushes CRITICAL (configurable) findings to Slack / Discord / Teams /
+    generic JSON webhooks and optional SMTP email. Rate-capped and de-duplicated
+    so a noisy host cannot flood a channel."""
+    _SEV = {'INFO': 0, 'WARNING': 1, 'CRITICAL': 2}
+
+    def __init__(self):
+        self._poster = _HttpPoster('Alert-Webhook')
+        self._lock = threading.Lock()
+        self._sent_times: deque = deque()
+        self._seen: dict = {}
+        self.suppressed = 0
+        self.dispatched = 0
+
+    @staticmethod
+    def format_payload(url: str, text: str, record: dict) -> dict:
+        low = url.lower()
+        if 'discord' in low:
+            return {'content': text[:1900]}
+        if 'slack' in low or 'office.com' in low or 'webhook.office' in low:
+            return {'text': text}
+        return {'text': text, **record}
+
+    @property
+    def enabled(self) -> bool:
+        return bool(CONFIG.get('alert_webhook_url')) or bool(
+            CONFIG.get('alert_email_to') and CONFIG.get('alert_smtp_host'))
+
+    def notify(self, severity: str, category: str, process: str, pid: int,
+               message: str, evidence: Optional[list] = None,
+               action: str = '') -> bool:
+        if not self.enabled:
+            return False
+        if self._SEV.get(severity, 0) < self._SEV.get(
+                CONFIG.get('alert_webhook_min_severity', 'CRITICAL'), 2):
+            return False
+        now = time.time()
+        key = (category, process, message[:120])
+        with self._lock:
+            if len(self._seen) > 5000:
+                cut = now - CONFIG.get('alert_dedupe_s', 300)
+                self._seen = {k: t for k, t in self._seen.items() if t > cut}
+            if now - self._seen.get(key, 0) < CONFIG.get('alert_dedupe_s', 300):
+                self.suppressed += 1
+                return False
+            while self._sent_times and now - self._sent_times[0] > 60:
+                self._sent_times.popleft()
+            if len(self._sent_times) >= CONFIG.get('alert_rate_per_min', 6):
+                self.suppressed += 1
+                return False
+            self._sent_times.append(now)
+            self._seen[key] = now
+            self.dispatched += 1
+        host = socket.gethostname()
+        text = f"[MedianBox/{host}] {severity} {category}: {message} (process={process} pid={pid})"
+        if action:
+            text += f" | response: {action}"
+        if evidence:
+            text += "\n" + "\n".join(f"  - {e}" for e in list(evidence)[:8])
+        record = {'host': host, 'severity': severity, 'category': category,
+                  'process': process, 'pid': pid, 'message': message,
+                  'evidence': list(evidence or [])[:20], 'response': action,
+                  'timestamp': datetime.datetime.fromtimestamp(now).isoformat()}
+        url = CONFIG.get('alert_webhook_url', '')
+        if url:
+            self._poster.post(url, json.dumps(self.format_payload(url, text, record)).encode())
+        if CONFIG.get('alert_email_to') and CONFIG.get('alert_smtp_host'):
+            threading.Thread(target=self._send_email, args=(severity, category, text),
+                             daemon=True, name="Alert-Email").start()
+        if CONFIG.get('alert_ntfy_topic'):
+            threading.Thread(target=self._send_ntfy, args=(severity, text),
+                             daemon=True, name="Alert-Ntfy").start()
+        return True
+
+    @staticmethod
+    def _send_ntfy(severity: str, text: str) -> None:
+        """Push notification via ntfy — free, keyless publish; works with the
+        hosted service or a self-hosted server (alert_ntfy_url)."""
+        try:
+            base = (CONFIG.get('alert_ntfy_url') or
+                    'https://ntfy.sh').rstrip('/')
+            url = base + '/' + str(CONFIG['alert_ntfy_topic']).lstrip('/')
+            req = urllib.request.Request(url, data=text.encode('utf-8'))
+            req.add_header('Title', 'MedianBox ' + severity)
+            req.add_header('Priority', '5' if severity == 'CRITICAL' else '3')
+            req.add_header('Tags', 'rotating_light' if severity == 'CRITICAL'
+                           else 'warning')
+            tok = CONFIG.get('alert_ntfy_token')
+            if tok:
+                req.add_header('Authorization', 'Bearer ' + str(tok))
+            urllib.request.urlopen(req, timeout=10)
+        except Exception as exc:
+            _logger.debug("ntfy push failed: %s", exc)
+
+    @staticmethod
+    def _send_email(severity: str, category: str, text: str) -> None:
+        try:
+            import smtplib
+            from email.message import EmailMessage
+            msg = EmailMessage()
+            msg['Subject'] = f"[MedianBox] {severity} {category}"
+            msg['From'] = CONFIG.get('alert_email_from') or CONFIG.get('alert_smtp_user') or 'medianbox@localhost'
+            msg['To'] = CONFIG['alert_email_to']
+            msg.set_content(text)
+            host, port = CONFIG['alert_smtp_host'], CONFIG.get('alert_smtp_port', 587)
+            if port == 465:
+                srv = smtplib.SMTP_SSL(host, port, timeout=15)
+            else:
+                srv = smtplib.SMTP(host, port, timeout=15)
+                srv.starttls()
+            with srv:
+                if CONFIG.get('alert_smtp_user'):
+                    srv.login(CONFIG['alert_smtp_user'], CONFIG.get('alert_smtp_password', ''))
+                srv.send_message(msg)
+        except Exception as exc:
+            _logger.debug("Alert email failed: %s", exc)
+
+
+class TlsIdentityProbe:
+    """Background, rate-limited TLS certificate fetcher feeding peer
+    identification. Results (including failures) are cached per IP."""
+    def __init__(self, min_interval: float = 0.25):
+        self._cache: dict = {}
+        self._pending: set = set()
+        self._q: "queue.Queue" = queue.Queue(maxsize=500)
+        self._lock = threading.Lock()
+        self._thread: Optional[threading.Thread] = None
+        self._min_interval = min_interval
+
+    def get(self, ip: str) -> Optional[dict]:
+        return self._cache.get(ip)
+
+    def request(self, ip: str, port: int = 443) -> None:
+        with self._lock:
+            if ip in self._cache or ip in self._pending:
+                return
+            self._pending.add(ip)
+            if self._thread is None:
+                self._thread = threading.Thread(target=self._loop, daemon=True, name="TLS-Identity")
+                self._thread.start()
+        try:
+            self._q.put_nowait((ip, port))
+        except queue.Full:
+            with self._lock:
+                self._pending.discard(ip)
+
+    def _loop(self):
+        while True:
+            ip, port = self._q.get()
+            res = tls_peer_subject(ip, port, timeout=4.0)
+            with self._lock:
+                if len(self._cache) > 20000:
+                    self._cache.clear()
+                self._cache[ip] = res
+                self._pending.discard(ip)
+            time.sleep(self._min_interval)
+
+
+class SignatureScanner:
+    """Byte-pattern signature engine — a self-contained YARA-subset that
+    scans process executables for known-malware artifacts.
+
+    Rules are [{"name", "desc", "severity", "patterns", "condition"}]:
+    patterns are literal byte strings or "hex:{ DE AD ?? }" expressions
+    with ?? wildcards; "condition" is "any" or "all". A baseline set is
+    compiled in; `signatures_file` (JSON, same schema) extends it so the
+    rule set can grow without a code release — standard YARA rules can
+    be converted mechanically to this schema.
+
+    Scans run on a background thread, cached per (path, mtime, size);
+    files are read once (capped at signatures_max_bytes) — no process is
+    ever touched, only its image on disk."""
+
+    _MAX_BYTES = 16 * 1024 * 1024
+
+    _BASELINE = (
+        {'name': 'eicar_test', 'desc': 'EICAR antivirus test string',
+         'severity': 'INFO', 'condition': 'any',
+         'patterns': ['X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR']},
+        {'name': 'mimikatz_core', 'desc': 'Mimikatz credential-dump module',
+         'severity': 'CRITICAL', 'condition': 'all',
+         'patterns': ['sekurlsa::', 'gentilkiwi']},
+        {'name': 'meterpreter',
+         'desc': 'Metasploit Meterpreter stager/api strings',
+         'severity': 'CRITICAL', 'condition': 'any',
+         'patterns': ['metsrv.dll', 'stdapi_sys_config_getuid',
+                      'core_loadlib']},
+        {'name': 'cobaltstrike_pipe',
+         'desc': 'Cobalt Strike default beacon named pipes',
+         'severity': 'CRITICAL', 'condition': 'any',
+         'patterns': ['\\\\.\\pipe\\MSSE-', '\\\\.\\pipe\\msagent_',
+                      '\\\\.\\pipe\\postex_ssh']},
+        {'name': 'psexec_service',
+         'desc': 'PsExec remote service binary',
+         'severity': 'WARNING', 'condition': 'any',
+         'patterns': ['PSEXESVC.EXE', 'PsExec Service Host']},
+        {'name': 'upx_packer', 'desc': 'UPX-packed executable',
+         'severity': 'WARNING', 'condition': 'all',
+         'patterns': ['UPX0', 'UPX1', 'hex:{ 55 50 58 21 }']},
+        {'name': 'powershell_cradle',
+         'desc': 'Web-download cradle embedded in binary',
+         'severity': 'WARNING', 'condition': 'all',
+         'patterns': ['DownloadString', 'Net.WebClient']},
+    )
+
+    def __init__(self):
+        self._q: "queue.Queue" = queue.Queue(maxsize=2000)
+        self._cache: dict = {}
+        self._pending: set = set()
+        self._thread: Optional[threading.Thread] = None
+        self._rules = self._compile(self._BASELINE)
+        self._rules.extend(self._load_user_rules())
+
+    # -- rule compilation -------------------------------------------------
+    @staticmethod
+    def _compile_hex(expr: str) -> list:
+        """'{ DE AD ?? EF }' -> list of ints/None (None = wildcard)."""
+        out = []
+        for tok in expr.strip('{}').split():
+            out.append(None if tok == '??' else int(tok, 16))
+        return out
+
+    @classmethod
+    def _compile(cls, rules) -> list:
+        out = []
+        for r in rules or []:
+            try:
+                pats = []
+                for p in r.get('patterns') or []:
+                    if p.startswith('hex:'):
+                        pats.append(('hex', cls._compile_hex(p[4:])))
+                    else:
+                        pats.append(('lit', p.encode('utf-8', 'ignore').lower()))
+                if pats:
+                    out.append({'name': str(r.get('name') or 'rule'),
+                                'desc': str(r.get('desc') or ''),
+                                'severity': str(r.get('severity')
+                                                or 'WARNING').upper(),
+                                'condition': str(r.get('condition')
+                                                 or 'any').lower(),
+                                'patterns': pats})
+            except Exception:
+                continue
+        return out
+
+    def _load_user_rules(self) -> list:
+        path = CONFIG.get('signatures_file') if 'CONFIG' in globals() else ''
+        if not path:
+            return []
+        try:
+            data = json.loads(open(path, encoding='utf-8').read())
+            rules = data if isinstance(data, list) else data.get('rules') or []
+            return self._compile(rules)
+        except Exception as exc:
+            _logger.debug("signature rules file unreadable: %s", exc)
+            return []
+
+    @staticmethod
+    def _match(pat, blob: bytes) -> bool:
+        kind, val = pat
+        if kind == 'lit':
+            return val in blob
+        # hex pattern — walk every offset (patterns are short; files ≤16MB)
+        n = len(val)
+        if n == 0:
+            return False
+        # fast path: no wildcards
+        if None not in val:
+            return bytes(v for v in val) in blob
+        end = len(blob) - n
+        i = 0
+        while i <= end:
+            j = 0
+            while j < n and (val[j] is None or blob[i + j] == val[j]):
+                j += 1
+            if j == n:
+                return True
+            i += 1
+        return False
+
+    # -- async plumbing (mirrors AuthenticodeVerifier) --------------------
+    def request(self, path: str) -> None:
+        key = path.lower()
+        if key in self._cache or key in self._pending:
+            return
+        if self._thread is None or not self._thread.is_alive():
+            self._thread = threading.Thread(
+                target=self._loop, daemon=True, name="SigScan")
+            self._thread.start()
+        self._pending.add(key)
+        try:
+            self._q.put_nowait((key, path))
+        except queue.Full:
+            self._pending.discard(key)
+
+    def get_cached(self, path: str):
+        return self._cache.get(path.lower())
+
+    def _loop(self):
+        while True:
+            try:
+                key, path = self._q.get(timeout=30)
+            except queue.Empty:
+                return
+            try:
+                self._cache[key] = self._scan(path)
+            finally:
+                self._pending.discard(key)
+
+    def _scan(self, path: str) -> dict:
+        try:
+            st = os.stat(path)
+            if st.st_size > self._MAX_BYTES:
+                return {'hit': None, 'skipped': 'too large',
+                        'rules': len(self._rules)}
+            with open(path, 'rb') as fh:
+                blob = fh.read(self._MAX_BYTES)
+        except Exception as exc:
+            return {'hit': None, 'skipped': str(exc)[:60],
+                    'rules': len(self._rules)}
+        lower = blob.lower()
+        for r in self._rules:
+            hits = [self._match(p, lower if p[0] == 'lit' else blob)
+                    for p in r['patterns']]
+            ok = all(hits) if r['condition'] == 'all' else any(hits)
+            if ok:
+                return {'hit': r['name'], 'desc': r['desc'],
+                        'severity': r['severity'],
+                        'rules': len(self._rules)}
+        return {'hit': None, 'rules': len(self._rules)}
+
+class AuthenticodeVerifier:
+    """Windows Authenticode (embedded + catalog) verification via
+    Get-AuthenticodeSignature. Runs on a background thread, cached per
+    (path, mtime, size) so each binary is verified once per change."""
+    def __init__(self):
+        self._cache: dict = {}
+        self._pending: set = set()
+        self._q: "queue.Queue" = queue.Queue(maxsize=500)
+        self._lock = threading.Lock()
+        self._thread: Optional[threading.Thread] = None
+
+    @staticmethod
+    def _key(path: str):
+        try:
+            st = os.stat(path)
+            return (path.lower(), int(st.st_mtime), st.st_size)
+        except OSError:
+            return None
+
+    @staticmethod
+    def _cn(subject: str) -> str:
+        m = re.search(r'CN=("([^"]+)"|[^,]+)', subject or '')
+        return (m.group(2) or m.group(1)).strip('"') if m else ''
+
+    def verify(self, path: str) -> dict:
+        """Blocking verification (use request()/get_cached() on hot paths)."""
+        if not _IS_WINDOWS:
+            return {'status': 'Unsupported', 'signer': '', 'cn': '', 'trusted': False}
+        script = ("$s = Get-AuthenticodeSignature -LiteralPath $env:MB_SIG_PATH; "
+                  "$o = [ordered]@{status=[string]$s.Status; signer=''}; "
+                  "if ($s.SignerCertificate) { $o.signer = $s.SignerCertificate.Subject }; "
+                  "$o | ConvertTo-Json -Compress")
+        try:
+            r = subprocess.run(
+                ['powershell', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+                 '-Command', script],
+                env={**os.environ, 'MB_SIG_PATH': path}, capture_output=True, text=True,
+                timeout=30, creationflags=0x08000000)
+            data = json.loads(r.stdout.strip() or '{}')
+        except Exception as exc:
+            _logger.debug("Authenticode check failed for %s: %s", path, exc)
+            return {'status': 'Error', 'signer': '', 'cn': '', 'trusted': False}
+        status = data.get('status') or 'Error'
+        signer = data.get('signer') or ''
+        return {'status': status, 'signer': signer, 'cn': self._cn(signer),
+                'trusted': status == 'Valid'}
+
+    def get_cached(self, path: str) -> Optional[dict]:
+        k = self._key(path)
+        return self._cache.get(k) if k else None
+
+    def request(self, path: str) -> None:
+        k = self._key(path)
+        if not k or k in self._cache:
+            return
+        with self._lock:
+            if k in self._pending:
+                return
+            self._pending.add(k)
+            if self._thread is None:
+                self._thread = threading.Thread(target=self._loop, daemon=True, name="Authenticode")
+                self._thread.start()
+        try:
+            self._q.put_nowait((k, path))
+        except queue.Full:
+            with self._lock:
+                self._pending.discard(k)
+
+    def _loop(self):
+        while True:
+            k, path = self._q.get()
+            res = self.verify(path)
+            with self._lock:
+                if len(self._cache) > 20000:
+                    self._cache.clear()
+                self._cache[k] = res
+                self._pending.discard(k)
+
+
+class AutoResponder:
+    """Opt-in, reversible containment. 'suspend' freezes a process (it can be
+    resumed); nothing is ever killed. Protected system processes and the
+    monitor itself are never touched."""
+    _PROTECTED = frozenset({
+        'system', 'system idle process', 'registry', 'smss.exe', 'csrss.exe',
+        'wininit.exe', 'services.exe', 'lsass.exe', 'winlogon.exe', 'svchost.exe',
+        'explorer.exe', 'dwm.exe', 'fontdrvhost.exe', 'msmpeng.exe', 'python.exe',
+        'pythonw.exe', 'python', 'python3', 'systemd', 'init', 'launchd',
+        'kernel_task', 'sshd', 'sihost.exe', 'taskhostw.exe', 'ctfmon.exe',
+        'searchhost.exe', 'runtimebroker.exe', 'securityhealthservice.exe',
+    })
+
+    def __init__(self):
+        self.actions: deque = deque(maxlen=200)
+        self._acted: set = set()
+        self._lock = threading.Lock()
+
+    _FW_PREFIX = 'MedianBox-Quarantine-'
+
+    @classmethod
+    def _quarantine(cls, proc, pid: int, name: str) -> str:
+        """Process frozen; outbound+inbound firewall rules block its image.
+        Fully reversible: rules are named MedianBox-Quarantine-<pid> and the
+        process can be resumed. Requires admin — without it the process is
+        still suspended and the miss is reported in the outcome."""
+        notes = ['suspended']
+        if not _IS_WINDOWS:
+            return 'suspended (firewall quarantine needs Windows admin)'
+        try:
+            exe = proc.exe()
+        except Exception:
+            exe = ''
+        if not exe:
+            return 'suspended (no exe path for firewall rule)'
+        rule = f'{cls._FW_PREFIX}{pid}'
+        try:
+            already = subprocess.run(
+                ['netsh', 'advfirewall', 'firewall', 'show', 'rule',
+                 f'name={rule}'], capture_output=True, timeout=10,
+                creationflags=_CREATE_NO_WINDOW, text=True)
+            if 'Rule Name' not in (already.stdout or ''):
+                subprocess.run(
+                    ['netsh', 'advfirewall', 'firewall', 'add', 'rule',
+                     f'name={rule}', 'dir=out', f'program={exe}',
+                     'action=block', 'protocol=any', 'enable=yes'],
+                    capture_output=True, timeout=10,
+                    creationflags=_CREATE_NO_WINDOW)
+                subprocess.run(
+                    ['netsh', 'advfirewall', 'firewall', 'add', 'rule',
+                     f'name={rule}_in', 'dir=in', f'program={exe}',
+                     'action=block', 'protocol=any', 'enable=yes'],
+                    capture_output=True, timeout=10,
+                    creationflags=_CREATE_NO_WINDOW)
+            check = subprocess.run(
+                ['netsh', 'advfirewall', 'firewall', 'show', 'rule',
+                 f'name={rule}'], capture_output=True, timeout=10,
+                creationflags=_CREATE_NO_WINDOW, text=True)
+            if 'Rule Name' in (check.stdout or ''):
+                notes.append(f'network blocked (rule {rule} — delete to '
+                             'restore access)')
+            else:
+                notes.append('firewall rule not installed (needs admin)')
+        except Exception as exc:
+            notes.append(f'firewall step failed: {exc}')
+        return '; '.join(notes)
+
+    def consider(self, pid: int, name: str, score: float, severity: str,
+                 reason: str) -> Optional[str]:
+        mode = CONFIG.get('auto_response', 'off')
+        if mode == 'off' or severity != 'CRITICAL':
+            return None
+        if score < CONFIG.get('auto_response_min_score', 80):
+            return None
+        if pid in (0, 4, os.getpid(), os.getppid()) or (name or '').lower() in self._PROTECTED:
+            return None
+        try:
+            proc = psutil.Process(pid)
+            if proc.name().lower() != (name or '').lower():
+                return None
+            key = (pid, proc.create_time())
+        except Exception:
+            return None
+        with self._lock:
+            if key in self._acted:
+                return None
+            self._acted.add(key)
+        outcome = 'dry_run: would ' + ('quarantine' if mode == 'quarantine'
+                                       else 'suspend')
+        if mode == 'suspend':
+            try:
+                proc.suspend()
+                outcome = 'suspended (resume from Processes or via psutil)'
+            except Exception as exc:
+                outcome = f'suspend failed: {exc}'
+        elif mode == 'quarantine':
+            try:
+                proc.suspend()
+                outcome = self._quarantine(proc, pid, name)
+            except Exception as exc:
+                outcome = f'quarantine failed: {exc}' 
+        self.actions.append({'time': time.time(), 'pid': pid, 'process': name,
+                             'score': score, 'reason': reason[:200], 'outcome': outcome})
+        _logger.warning("AutoResponder: %s pid=%s (%s) -> %s", name, pid, reason[:80], outcome)
+        return outcome
+
+    @staticmethod
+    def resume(pid: int) -> bool:
+        try:
+            psutil.Process(pid).resume()
+            return True
+        except Exception:
+            return False
+
+
+def packet_capture_status() -> tuple:
+    """(ok, message) — is a packet-capture driver present? Used for a plain
+    startup notice instead of a buried log line."""
+    if _IS_WINDOWS:
+        root = os.environ.get('SystemRoot', r'C:\Windows')
+        for p in (os.path.join(root, 'System32', 'Npcap', 'wpcap.dll'),
+                  os.path.join(root, 'System32', 'wpcap.dll')):
+            if os.path.exists(p):
+                return True, f"Npcap/WinPcap present ({p})"
+        return False, ("Npcap is NOT installed - packet-level detection (SNI, JA4+, DNS "
+                       "tunneling, passive TCP/TLS fingerprints) is DISABLED. "
+                       "Install from https://npcap.com (WinPcap-compatible mode).")
+    import ctypes.util
+    if ctypes.util.find_library('pcap'):
+        return True, "libpcap present"
+    return False, "libpcap not found - packet-level detection is DISABLED."
+
+
+def tls_peer_subject(ip: str, port: int = 443, timeout: float = 4.0) -> dict:
+    """Read the TLS certificate a peer presents (active probe: opens one TCP
+    connection). Subject/issuer/SANs name who operates the endpoint even when
+    DNS and rDNS are silent."""
+    import ssl
+    out = {'ok': False}
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        with socket.create_connection((ip, port), timeout=timeout) as raw:
+            with ctx.wrap_socket(raw, server_hostname=None) as s:
+                cert = s.getpeercert() or {}
+        flat = lambda rdns: {k: v for r in rdns for k, v in r}
+        out.update(ok=True, trusted=True,
+                   subject=flat(cert.get('subject', ())), issuer=flat(cert.get('issuer', ())),
+                   san=[v for k, v in cert.get('subjectAltName', ()) if k == 'DNS'][:20],
+                   not_after=cert.get('notAfter', ''))
+    except ssl.SSLCertVerificationError:
+        # Self-signed / private-CA endpoints (routers, NAS boxes, self-hosted
+        # services) fail verification but still PRESENT a cert whose subject
+        # names the device or org — read it with verification off.
+        try:
+            ctx2 = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            ctx2.check_hostname = False
+            ctx2.verify_mode = ssl.CERT_NONE
+            with socket.create_connection((ip, port), timeout=timeout) as raw:
+                with ctx2.wrap_socket(raw, server_hostname=None) as s:
+                    der = s.getpeercert(binary_form=True)
+            cert = {}
+            if der:
+                import tempfile
+                pem = ssl.DER_cert_to_PEM_cert(der)
+                with tempfile.NamedTemporaryFile('w', suffix='.pem', delete=False) as tf:
+                    tf.write(pem)
+                    tmp = tf.name
+                try:
+                    cert = ssl._ssl._test_decode_cert(tmp)  # type: ignore
+                finally:
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+            flat = lambda rdns: {k: v for r in rdns for k, v in r}
+            out.update(ok=True, trusted=False,
+                       subject=flat(cert.get('subject', ())), issuer=flat(cert.get('issuer', ())),
+                       san=[v for k, v in cert.get('subjectAltName', ()) if k == 'DNS'][:20],
+                       not_after=cert.get('notAfter', ''),
+                       note='self-signed/private CA — cert is identity as presented, not verified')
+        except Exception as exc:
+            out.update(ok=False, trusted=False, error=str(exc)[:160])
+    except Exception as exc:
+        out['error'] = str(exc)[:160]
+    return out
+
+
+# ===================== ACTIVE REVERSE PROBE =====================
+# Send/receive probes against an observed endpoint. Everything here reaches
+# only the endpoint's own stack — a VPN/proxy/Tor exit, CDN edge or relay
+# answers AS ITSELF. What it volunteers is still real identity evidence:
+# software banners, HTTP disclosure headers, negotiated MSS (encapsulation
+# on the path), ICMP reachability and hop distance, firewall posture.
+_TCP_MAXSEG = getattr(socket, 'TCP_MAXSEG', 5)
+_HTTP_PROBE_PORTS = frozenset({80, 81, 591, 2082, 2375, 3000, 5000, 5601,
+                             8000, 8008, 8080, 8081, 8082, 8443, 8888,
+                             9000, 9090, 10000})
+
+_VPN_UDP_PORTS = frozenset({500, 1194, 4500})
+
+# IKE VID payloads: hex md5-style VIDs that name a vendor, plus ASCII
+# needles vendors embed verbatim. Capability VIDs (DPD/NAT-T/frag) map to
+# '' — they prove IKE but not a vendor.
+_IKE_VID_VENDOR = {
+    '1e2b516905991c7d7c96fcbfb587e461': 'Microsoft Windows/RRAS',
+    '12f5f28c457168a9702d9fe274cc0100': 'Cisco Unity',
+    '404bf439522ca3f6': '',                       # Cisco DPD
+    'afcad71368a1f1c96b8696fc77570100': '',       # RFC 3706 DPD
+    '4a131c81070358455c5728f20e95452f': '',       # RFC 3947 NAT-T
+    '90cb80913ebb696e086381b5ec427b1f': '',       # draft NAT-T
+    '7d9419a65310ca6f2c179d9215529d56': '',       # IKE fragmentation
+    'cd60464335df21f87cfdb2fc68b6a448': '',       # IKEv2 fragmentation
+}
+_IKE_VID_ASCII = (
+    (b'strongswan', 'strongSwan'), (b'libreswan', 'Libreswan'),
+    (b'openswan', 'Openswan'), (b'fortigate', 'FortiGate'),
+    (b'fortinet', 'Fortinet'), (b'sonicwall', 'SonicWall'),
+    (b'watchguard', 'WatchGuard'), (b'netscreen', 'NetScreen/Juniper'),
+    (b'mikrotik', 'MikroTik RouterOS'), (b'checkpoint', 'Check Point'),
+    (b'cisco', 'Cisco'), (b'juniper', 'Juniper'), (b'vyatta', 'Vyatta'),
+)
+
+
+def _ike_vendor(resp: bytes) -> str:
+    """Walk an IKE_SA_INIT response's payload chain; VID payloads hash or
+    spell the responder's vendor. Returns a vendor name or a VID count."""
+    if len(resp) < 32:
+        return ''
+    nxt, pos, n_vids = resp[16], 28, 0
+    while nxt and pos + 4 <= len(resp):
+        plen = struct.unpack_from('>H', resp, pos + 2)[0]
+        if plen < 4 or pos + plen > len(resp):
+            break
+        data = resp[pos + 4:pos + plen]
+        if nxt == 130:                                   # VID payload
+            vend = _IKE_VID_VENDOR.get(data.hex(), None)
+            if vend:
+                return vend
+            low = data.lower()
+            hit = next((name for needle, name in _IKE_VID_ASCII
+                        if needle in low), '')
+            if hit:
+                return hit
+            n_vids += 1
+        nxt, pos = resp[pos], pos + plen
+    return f'{n_vids} VID payload(s)' if n_vids else ''
+
+
+def _vpn_udp_probe(ip: str, port: int, timeout: float = 2.5) -> dict:
+    """Positive-reply VPN fingerprints on the wire. IKE_SA_INIT gets a
+    structured, SPI-echoed reply only from a real IPsec gateway; an
+    OpenVPN hard-reset gets a control reply only from a real OpenVPN UDP
+    listener. Silence is never counted as evidence."""
+    out: dict = {}
+    fam = socket.AF_INET6 if ':' in ip else socket.AF_INET
+
+    def _ex(pkt: bytes) -> bytes:
+        s = socket.socket(fam, socket.SOCK_DGRAM)
+        s.settimeout(timeout)
+        try:
+            s.sendto(pkt, (ip, port))
+            return s.recvfrom(4096)[0]
+        except (socket.timeout, OSError):
+            return b''
+        finally:
+            s.close()
+
+    if port in (500, 4500):
+        spi = os.urandom(8)
+        # IKE_SA_INIT: SA(AES-CBC-128/SHA1/PRF-SHA1/MODP-1024) + KE + NONCE
+        transforms = (
+            b'\x03\x00\x00\x0c\x01\x00\x00\x0c\x80\x0e\x00\x80'
+            b'\x03\x00\x00\x08\x02\x00\x00\x02'
+            b'\x03\x00\x00\x08\x03\x00\x00\x02'
+            b'\x00\x00\x00\x08\x04\x00\x00\x02')
+        prop = (b'\x00\x00' + struct.pack('>H', 8 + len(transforms))
+                + b'\x01\x01\x00\x04' + transforms)
+        sa = b'\x22\x00' + struct.pack('>H', 4 + len(prop)) + prop
+        ke = (b'\x28\x00' + struct.pack('>H', 8 + 128)
+              + b'\x00\x02\x00\x00' + os.urandom(128))
+        nonce = b'\x00\x00' + struct.pack('>H', 20) + os.urandom(16)
+        body = sa + ke + nonce
+        ike = (spi + b'\x00' * 8 + b'\x21\x20\x22\x08' + b'\x00' * 4
+               + struct.pack('>I', 28 + len(body)) + body)
+        resp = _ex((b'\x00' * 4) + ike if port == 4500 else ike)
+        if port == 4500 and resp[:4] == b'\x00' * 4:
+            resp = resp[4:]
+        if len(resp) >= 28 and resp[:8] == spi and resp[18] == 0x22:
+            out['ike'] = True
+            vend = _ike_vendor(resp)
+            if vend:
+                out['ike_vendor'] = vend
+    if port == 1194:
+        # P_CONTROL_HARD_RESET_CLIENT: only an OpenVPN listener answers.
+        resp = _ex(b'\x38' + os.urandom(8) + b'\x00' * 5)
+        if resp and 2 <= (resp[0] >> 3) <= 8:
+            out['openvpn'] = True
+    if out:
+        out['port'] = port
+    return out
+
+
+
+def _tcp_probe(ip: str, port: int, timeout: float = 3.0, send: Optional[bytes] = None,
+               read_s: float = 2.0, read_n: int = 512) -> dict:
+    """One active connect: handshake RTT, negotiated MSS, first bytes."""
+    fam = socket.AF_INET6 if ':' in ip else socket.AF_INET
+    out = {'port': port, 'open': False, 'rtt_ms': 0.0, 'mss': 0,
+           'banner': b'', 'err': ''}
+    s = socket.socket(fam, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    t0 = time.perf_counter()
+    try:
+        rc = s.connect_ex((ip, port))
+    except OSError as exc:
+        out['err'] = str(exc)[:60]
+        s.close()
+        return out
+    out['rtt_ms'] = (time.perf_counter() - t0) * 1000
+    if rc != 0:
+        out['err'] = ('rst (port closed)' if rc in (10061, 111)
+                      else 'filtered (no reply)' if rc in (10060, 110, 10035, 10065, 113)
+                      else f'err {rc}')
+        s.close()
+        return out
+    out['open'] = True
+    try:
+        out['mss'] = s.getsockopt(socket.IPPROTO_TCP, _TCP_MAXSEG)
+    except OSError:
+        pass
+    try:
+        if send is not None:
+            s.sendall(send)
+        s.settimeout(read_s)
+        while len(out['banner']) < read_n:
+            chunk = s.recv(min(2048, read_n - len(out['banner'])))
+            if not chunk:
+                break
+            out['banner'] += chunk
+            if send is None and b'\n' in out['banner']:
+                break
+    except (socket.timeout, OSError):
+        pass
+    s.close()
+    return out
+
+
+def _banner_guess(b: bytes) -> str:
+    """Name the endpoint software its greeting discloses."""
+    if not b:
+        return ''
+    line = b.split(b'\n', 1)[0][:150]
+    t = line.decode('latin1', 'replace').strip()
+    if t.startswith('SSH-'):
+        return f'SSH server stack: {t[:80]}'
+    if t[:3] in ('220', '221'):
+        return f'SMTP/FTP greeting: {t[:100]}'
+    if b.startswith(b'HTTP/'):
+        srv = re.search(rb'(?im)^Server:\s*(.+?)\s*$', b)
+        return (f"HTTP {t.split()[1] if len(t.split()) > 1 else ''} server "
+                f"'{srv.group(1).decode('latin1', 'replace')[:60] if srv else '?'}'")
+    if b.startswith(b'\x13BitTorrent protocol'):
+        return 'BitTorrent peer (handshake response)'
+    if b[:1] == b'\x05' and len(b) >= 2:
+        return 'SOCKS5 proxy (method reply)'
+    if b[:2] == b'\x03\x00' or b[:1] == b'\x03':
+        return 'RDP/TPKT (Remote Desktop / TLS-transport)'
+    if b[:4] in (b'* OK', b'+OK '):
+        return f'IMAP/POP3 greeting: {t[:100]}'
+    if t and all(32 <= c < 127 for c in b[:min(len(b), 40)]):
+        return f'banner: {t[:100]}'
+    return f'binary service ({len(b)} bytes, {b[:12].hex()})'
+
+
+def _http_probe(ip: str, port: int, timeout: float = 4.0) -> dict:
+    """HEAD / — origin servers disclose themselves through response headers
+    (Server, X-Powered-By, Via, X-Backend) and CDN edges name their site
+    (CF-RAY's IATA suffix, X-Served-By cache node)."""
+    req = (f'HEAD / HTTP/1.1\r\nHost: {ip}\r\n'
+           'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\n'
+           'Accept: */*\r\nConnection: close\r\n\r\n').encode()
+    r = _tcp_probe(ip, port, timeout, send=req, read_s=3.0, read_n=2048)
+    out = {'open': r['open'], 'status': '', 'headers': {}}
+    if not r['open']:
+        out['err'] = r['err'] or 'connect failed'
+        return out
+    b = r['banner']
+    if not b.startswith(b'HTTP/'):
+        out['err'] = 'non-HTTP response'
+        if r['banner']:
+            out['banner'] = _banner_guess(b)
+        return out
+    out['status'] = b.split(b'\r\n', 1)[0].decode('latin1', 'replace')[:80]
+    for name in (b'Server', b'X-Powered-By', b'Via', b'CF-RAY', b'X-Cache',
+                 b'X-Served-By', b'X-Backend-Server', b'X-Cache-Hits',
+                 b'X-Akamai-Transformed', b'X-CDN', b'Strict-Transport-Security'):
+        m = re.search(rb'(?im)^' + re.escape(name) + rb':\s*(.+?)\s*$', b)
+        if m:
+            v = m.group(1).decode('latin1', 'replace')[:120]
+            if name == b'CF-RAY':
+                site = re.search(r'-([A-Z]{3})\s*$', v)
+                if site:
+                    v += f'  (edge site {site.group(1)})'
+            out['headers'][name.decode()] = v
+    return out
+
+
+def _icmp_echo(ip: str, timeout: float = 2.5) -> dict:
+    """One ICMP echo. The reply TTL estimates routed-hop distance and the
+    endpoint's OS class (initial TTL 64=Unix-class, 128=Windows, 255=gear)."""
+    out = {'replied': None}
+    try:
+        from scapy.all import ICMP as _ICMP, sr1 as _sr1
+        t0 = time.perf_counter()
+        ans = _sr1(IP(dst=ip) / _ICMP() / (b'mbx' * 4), timeout=timeout, verbose=0)
+        out['rtt_ms'] = round((time.perf_counter() - t0) * 1000, 1)
+        if ans is not None:
+            out['replied'] = True
+            out['ttl'] = int(getattr(ans, 'ttl', 0) or 0)
+            for base, stack in ((255, 'network gear/embedded'), (128, 'Windows-class'),
+                                (64, 'Unix/Linux-class'), (32, 'legacy')):
+                if 0 < out['ttl'] <= base:
+                    out['hops_est'] = base - out['ttl']
+                    out['stack'] = stack
+                    break
+        else:
+            out['replied'] = False
+    except Exception:
+        pass  # raw ICMP needs privilege/Npcap — unavailable is itself data
+    return out
+
+
+def _trace_port(d: dict) -> int:
+    for lo in d.get('local', []):
+        if lo.get('remote_port'):
+            return lo['remote_port']
+    return 443
+
+
+def _active_reverse_probe(ip: str, port: int = 0, deep: bool = False) -> dict:
+    """The send/receive half of the trace. Bounded: <=7 TCP connects + 1
+    ICMP, ~8s worst case. Finds only what the endpoint itself volunteers."""
+    port = port or 443
+    out: dict = {'target_port': port, 'rtts': [], 'icmp': {}}
+    primary = _tcp_probe(ip, port, send=None)
+    out['primary'] = primary
+    if primary['open']:
+        out['rtts'].append(primary['rtt_ms'])
+    banner = _banner_guess(primary['banner'])
+    if banner:
+        out['banner'] = banner
+    if port in _HTTP_PROBE_PORTS or (primary['open'] and not banner):
+        out['http'] = _http_probe(ip, port)
+    if deep:
+        if port != 80:
+            alt = _tcp_probe(ip, 80, timeout=2.0, send=None, read_s=0.6, read_n=64)
+            if alt['open'] and 'http' not in out:
+                out['http'] = _http_probe(ip, 80)
+        neigh = {}
+        for p in (port - 1, port + 1):
+            if 0 < p < 65536 and p not in (port, 80):
+                r = _tcp_probe(ip, p, timeout=1.8, send=None, read_s=0.3, read_n=1)
+                neigh[p] = 'open' if r['open'] else (r['err'] or 'closed')
+        out['neighbors'] = neigh
+    if primary['open'] and len(out['rtts']) < 3:
+        for _ in range(2):
+            r = _tcp_probe(ip, port, timeout=2.0, send=None, read_s=0.3, read_n=1)
+            if r['open']:
+                out['rtts'].append(r['rtt_ms'])
+    out['icmp'] = _icmp_echo(ip)
+    return out
+
+
+def _render_active_probe(act: dict, ind: str) -> list:
+    L = [ind + "-" * 60,
+         ind + "ACTIVE REVERSE PROBE — send/receive, what the endpoint's stack volunteers"]
+    p = act.get('primary') or {}
+    if p.get('open'):
+        mss = p.get('mss') or 0
+        if mss >= 1460:
+            path = ' — full 1500-byte MTU path (no tunnel overhead visible)'
+        elif mss:
+            path = f' — MSS {mss} < 1460: encapsulation overhead on the path (VPN/tunnel/PPPoE clamp)'
+        else:
+            path = ''
+        rtts = act.get('rtts') or []
+        med = f"  median {statistics.median(rtts):.1f} ms over {len(rtts)} connects" if len(rtts) > 1 else ''
+        L.append(f"{ind}Connect     : :{act['target_port']} open, handshake RTT {p['rtt_ms']:.1f} ms{med}{path}")
+    else:
+        L.append(f"{ind}Connect     : :{act['target_port']} {p.get('err') or 'closed/no reply'}")
+    if act.get('banner'):
+        L.append(f"{ind}Banner      : {act['banner']}")
+    h = act.get('http')
+    if h and h.get('status'):
+        L.append(f"{ind}HTTP HEAD   : {h['status']}")
+        for k, v in (h.get('headers') or {}).items():
+            L.append(f"{ind}  {k:<24}: {v}")
+    elif act.get('http', {}).get('banner'):
+        L.append(f"{ind}HTTP probe  : {act['http']['banner']}")
+    ic = act.get('icmp') or {}
+    if ic.get('replied'):
+        L.append(f"{ind}ICMP echo   : reply, ttl={ic.get('ttl')} -> ~{ic.get('hops_est')} routed hops, "
+                 f"{ic.get('stack', '')} stack, rtt {ic.get('rtt_ms')} ms")
+    elif ic.get('replied') is False:
+        L.append(f"{ind}ICMP echo   : no reply (ICMP filtered or host down)")
+    else:
+        L.append(f"{ind}ICMP echo   : skipped — raw sockets need admin/Npcap on this host")
+    for pn, st in (act.get('neighbors') or {}).items():
+        L.append(f"{ind}Port {pn:<7} : {st}  (firewall/host posture around the observed port)")
+    L.append(ind + "  > probes reach the ENDPOINT's own stack — an exit/edge/relay answers as itself;")
+    L.append(ind + "    nothing sent can reach a client behind it, which is a property of tunneling,")
+    L.append(ind + "    not a missing feature. The client-side path runs through the operator (below).")
+    return L
+
+
+# ===================== ENDPOINT DISCLOSURE SURFACE =====================
+# Probes where the endpoint itself emits information — some of it about a
+# party behind its own address (a resolver's egress, an NTP server's
+# peers, a proxy's forwarded client header). Plus public databases that
+# map every name/site that has ever lived on the address.
+
+def _dns_wire_query(name: str, qtype: int = 16, qclass: int = 3, qid: int = 0x1a2b) -> bytes:
+    q = struct.pack('>HHHHHH', qid, 0x0100, 1, 0, 0, 0)
+    for lbl in name.split('.'):
+        b = lbl.encode('ascii', 'replace')[:63]
+        q += bytes([len(b)]) + b
+    return q + b'\x00' + struct.pack('>HH', qtype, qclass)
+
+
+def _dns_parse_txt(resp: bytes) -> list:
+    """Minimal DNS response walker — extracts TXT answer strings only."""
+    out = []
+    if len(resp) < 12:
+        return out
+    qd, an = struct.unpack_from('>H', resp, 4)[0], struct.unpack_from('>H', resp, 6)[0]
+    off = 12
+
+    def skip_name(o):
+        while o < len(resp):
+            ln = resp[o]
+            if ln == 0:
+                return o + 1
+            if ln & 0xC0 == 0xC0:
+                return o + 2
+            o += 1 + ln
+        return o
+    for _ in range(qd):
+        off = skip_name(off) + 4
+    for _ in range(an):
+        off = skip_name(off)
+        if off + 10 > len(resp):
+            break
+        rtype, _rc, _ttl, rdlen = struct.unpack_from('>HHIH', resp, off)
+        off += 10
+        rdata = resp[off:off + rdlen]
+        off += rdlen
+        if rtype == 16:
+            pos = 0
+            while pos < len(rdata):
+                ln = rdata[pos]
+                pos += 1
+                out.append(rdata[pos:pos + ln].decode('latin1', 'replace'))
+                pos += ln
+    return out
+
+
+def _dns_udp_txt(server: str, name: str, qtype: int = 16, qclass: int = 3,
+                 timeout: float = 2.5) -> list:
+    try:
+        s = socket.socket(socket.AF_INET6 if ':' in server else socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(timeout)
+        s.sendto(_dns_wire_query(name, qtype, qclass), (server, 53))
+        resp, _ = s.recvfrom(2048)
+        s.close()
+        return _dns_parse_txt(resp)
+    except (socket.timeout, OSError):
+        return []
+
+
+def _dns_identity_probes(ip: str) -> dict:
+    """Ask the endpoint's DNS service to name itself. CHAOS class records
+    make BIND/Unbound/dnsmasq state their own hostname and version. If the
+    endpoint runs an OPEN recursive resolver, querying a self-revealing
+    record (Google/Cloudflare echo the requester's source IP) returns the
+    resolver's EGRESS address — the IP it actually talks out of, which can
+    be a different machine than the address it listens on."""
+    out = {}
+    for name, qc in (('hostname.bind', 3), ('version.bind', 3), ('id.server', 3),
+                     ('authors.bind', 3), ('whoami.cloudflare', 3),
+                     ('o-o.myaddr.l.google.com', 1)):
+        txts = _dns_udp_txt(ip, name, 16, qc)
+        if txts:
+            out[name] = txts[:4]
+    return out
+
+
+def _ntp_probe(ip: str, timeout: float = 2.5) -> dict:
+    """NTP mode-6 readvar: a server answering control queries discloses its
+    OS, ntpd version, refid and sometimes peer addresses — the operator's
+    time-source infrastructure."""
+    out = {}
+    req = b'\x16\x02\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00'
+    try:
+        s = socket.socket(socket.AF_INET6 if ':' in ip else socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(timeout)
+        s.sendto(req, (ip, 123))
+        resp, _ = s.recvfrom(2048)
+        s.close()
+    except (socket.timeout, OSError):
+        return out
+    if len(resp) < 12:
+        return out
+    cnt = struct.unpack_from('>H', resp, 10)[0]
+    data = resp[12:12 + min(cnt, len(resp) - 12)]
+    txt = data.split(b'\x00')[0].decode('latin1', 'replace')
+    for m in re.finditer(r'(\w+)=("([^"]*)"|[^,\s]+)', txt):
+        k, v = m.group(1), (m.group(3) if m.group(3) is not None else m.group(2))
+        if k in ('system', 'processor', 'version', 'stratum', 'refid', 'leap', 'mintime'):
+            out[k] = v[:80]
+    return out
+
+
+def _page_probe(ip: str, port: int, timeout: float = 4.5) -> dict:
+    """GET the page an HTTP endpoint serves: <title> and <meta generator>
+    name the product/org even when headers are stripped."""
+    out = {}
+    if port not in _HTTP_PROBE_PORTS and port != 80:
+        return out
+    req = (f'GET / HTTP/1.1\r\nHost: {ip}\r\n'
+           'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\n'
+           'Accept: text/html,*/*\r\nConnection: close\r\n\r\n').encode()
+    r = _tcp_probe(ip, port, timeout, send=req, read_s=3.5, read_n=49152)
+    b = r['banner']
+    if not b.startswith(b'HTTP/'):
+        if r['banner']:
+            out['banner'] = _banner_guess(b)
+        return out
+    body = b.split(b'\r\n\r\n', 1)[-1]
+    t = re.search(rb'<title[^>]*>(.*?)</title>', body, re.I | re.S)
+    if t:
+        out['title'] = re.sub(r'\s+', ' ', t.group(1).decode('utf-8', 'replace')).strip()[:140]
+    for m in re.finditer(rb'<meta[^>]+name=["\']?([\w-]+)["\']?[^>]+content=["\']([^"\']{1,80})', body, re.I):
+        if m.group(1).lower() in (b'generator', b'author', b'description', b'application-name'):
+            out[m.group(1).decode().lower()] = m.group(2).decode('utf-8', 'replace')[:120]
+    return out
+
+
+def _vhost_probe(ip: str) -> dict:
+    """Every name that points at this address: reverse-IP (vhost neighbors —
+    shared hosting leaks co-tenant domains) and urlscan's crawl index."""
+    out: dict = {'domains': [], 'urlscan': []}
+    try:
+        txt = _trace_fetch(f'https://api.hackertarget.com/reverseiplookup/?q={ip}',
+                           6.0, 'text/plain', raw=True) or ''
+        for line in str(txt).splitlines():
+            dom = line.split(',')[-1].strip().lower()
+            first = dom.split('.')[0]
+            junk = (first.isdigit() and len(first) > 6) or dom.count('.') > 5 \
+                or 'in-addr' in dom or 'ip6.arpa' in dom
+            if '.' in dom and not junk and 'error' not in dom and 'api count' not in dom:
+                out['domains'].append(dom)
+        out['domains'] = out['domains'][:30]
+    except Exception:
+        pass
+    try:
+        j = _trace_fetch(f'https://urlscan.io/api/v1/search/?q=ip:{ip}', 7.0) or {}
+        for r in (j.get('results') or [])[:10]:
+            pg = r.get('page') or {}
+            if pg.get('domain'):
+                out['urlscan'].append({'domain': pg['domain'],
+                                       'url': (pg.get('url') or '')[:90],
+                                       'time': (r.get('task') or {}).get('time', '')})
+    except Exception:
+        pass
+    return out
+
+
+def _crtsh_names(domain: str) -> list:
+    """Certificate Transparency: every hostname the operator has ever put on
+    a public cert — internal/dev/staging names included."""
+    try:
+        j = _trace_fetch(f'https://crt.sh/?q=%25.{domain}&output=json', 8.0)
+        names = set()
+        for row in (j if isinstance(j, list) else []):
+            for n in str(row.get('name_value', '')).split('\n'):
+                n = n.strip().lstrip('*.').lower()
+                if n and '.' in n:
+                    names.add(n)
+        return sorted(names)[:40]
+    except Exception:
+        return []
+
+
+def _trace_history(ip: str) -> list:
+    """Everything this machine's own database remembers about the target —
+    past processes, ports, services and first/last contact."""
+    dbf = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       CONFIG.get('db_file', 'medianbox_ultimate.db'))
+    if not os.path.exists(dbf):
+        return []
+    try:
+        con = sqlite3.connect(f'file:{dbf}?mode=ro', uri=True, timeout=2)
+        rows = con.execute(
+            "SELECT process,remote_port,service,domain,via,first_seen,last_seen "
+            "FROM connections WHERE remote_ip=? ORDER BY last_seen DESC LIMIT 12",
+            (ip,)).fetchall()
+        con.close()
+    except Exception:
+        return []
+    out = []
+    for r in rows:
+        out.append({'process': r[0], 'port': r[1], 'service': r[2], 'domain': r[3],
+                    'via': r[4],
+                    'first': datetime.datetime.fromtimestamp(r[5]).isoformat(timespec='seconds') if r[5] else '',
+                    'last': datetime.datetime.fromtimestamp(r[6]).isoformat(timespec='seconds') if r[6] else ''})
+    return out
+
+
+class CanaryRegistry:
+    """Callback tokens that report WHO fetched them. The one channel where
+    the party behind a connection sends the revealing packet itself: a URL
+    minted here, delivered to the remote party through any channel it
+    already uses, fetches at THIS host from the fetcher's real egress —
+    for a proxied party whose app bypasses its own tunnel (WebRTC/direct-
+    fetch style), that egress is the pre-tunnel address. Every hit is
+    fingerprinted: source IP+port, User-Agent, Accept-Language, referer."""
+    _inst: Optional['CanaryRegistry'] = None
+
+    def __init__(self):
+        self.tokens: dict[str, dict] = {}
+        self.hits: list = []
+        self.lock = threading.Lock()
+
+    @classmethod
+    def inst(cls) -> 'CanaryRegistry':
+        if cls._inst is None:
+            cls._inst = cls()
+        return cls._inst
+
+    def mint(self, note: str = '', target: str = '') -> str:
+        tok = hashlib.sha256(f'{time.time()}:{random.getrandbits(64)}'.encode()).hexdigest()[:18]
+        with self.lock:
+            self.tokens[tok] = {'created': time.time(), 'note': note, 'target': target}
+        return tok
+
+    def hit(self, token: str, ip: str, port: int, headers: dict) -> dict:
+        t = self.tokens.get(token)
+        ent = {'time': datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'),
+               'token': token, 'ip': ip, 'port': port,
+               'ua': headers.get('user-agent', '')[:160],
+               'lang': headers.get('accept-language', '')[:60],
+               'referer': headers.get('referer', '')[:120],
+               'for': (t or {}).get('note', ''), 'breakthrough': False}
+        # The fetcher's egress differs from the observed endpoint => the
+        # fetch did not come through the same tunnel — a direct-fetch leak.
+        if t and t.get('target') and ip != t['target']:
+            ent['breakthrough'] = True
+        with self.lock:
+            self.hits.append(ent)
+            self.hits = self.hits[-500:]
+        _logger.info("CANARY HIT %s from %s:%s ua=%r%s", token, ip, port, ent['ua'],
+                     '  *** DIFFERENT EGRESS THAN TARGET ***' if ent['breakthrough'] else '')
+        return ent
+
+
+_PUBLIC_IP_CACHE: dict = {'ts': 0.0, 'ip': ''}
+
+
+def _public_ip(timeout: float = 4.0) -> str:
+    if time.time() - _PUBLIC_IP_CACHE['ts'] < 300 and _PUBLIC_IP_CACHE['ip']:
+        return _PUBLIC_IP_CACHE['ip']
+    for url in ('https://api.ipify.org', 'https://icanhazip.com'):
+        try:
+            txt = str(_trace_fetch(url, timeout, 'text/plain', raw=True) or '').strip()
+            if re.fullmatch(r'[0-9a-fA-F:.]{3,45}', txt):
+                _PUBLIC_IP_CACHE.update(ts=time.time(), ip=txt)
+                return txt
+        except Exception:
+            continue
+    return ''
+
+
+class _CanaryHandler:
+    @staticmethod
+    def make(registry):
+        from http.server import BaseHTTPRequestHandler
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                m = re.match(r'^/c/([0-9a-f]{8,32})$', self.path)
+                hdrs = {k.lower(): v for k, v in self.headers.items()}
+                if m:
+                    registry.hit(m.group(1), self.client_address[0],
+                                 self.client_address[1], hdrs)
+                body = (b'<!doctype html><title>ok</title>'
+                        + (b'<!-- ' + m.group(1).encode() + b' -->' if m else b''))
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+        return H
+
+
+_canary_server: dict = {'srv': None, 'port': 0}
+
+
+def canary_listen(port: int) -> int:
+    """Start (or reuse) the canary callback HTTP listener. Returns bound port."""
+    if _canary_server['srv'] is not None:
+        return _canary_server['port']
+    from http.server import ThreadingHTTPServer
+    srv = ThreadingHTTPServer(('0.0.0.0', port), (_DemaskHandler.make(CanaryRegistry.inst())
+                                             if '_DemaskHandler' in globals() else
+                                             _CanaryHandler.make(CanaryRegistry.inst())))
+    threading.Thread(target=srv.serve_forever, daemon=True, name='Canary').start()
+    _canary_server['srv'] = srv
+    _canary_server['port'] = srv.server_address[1]
+    return _canary_server['port']
+
+
+def _canary_for_trace(ip: str) -> dict:
+    port = _canary_server.get('port') or 0
+    if not port:
+        return {}
+    reg = CanaryRegistry.inst()
+    tok = reg.mint(note=f'trace of {ip}', target=ip)
+    pub = _public_ip() or '<this host public IP>'
+    return {'url': f'http://{pub}:{port}/c/{tok}', 'port': port,
+            'note': 'deliver via any channel the remote party uses; a fetch reveals the fetcher\'s real egress'}
+
+
+def _render_disclosure(dis: dict, ind: str) -> list:
+    if not dis or not any(dis.get(k) for k in ('dns', 'ntp', 'page', 'vhosts', 'ct_names', 'history', 'vpn_gate', 'selfid')):
+        return []
+    L = [ind + "-" * 60,
+         ind + "DISCLOSURE SURFACE — everything the endpoint and public record name"]
+    dns = dis.get('dns') or {}
+    for name, txts in dns.items():
+        tag = ' (resolver EGRESS — the address it really talks out of)' \
+            if name in ('o-o.myaddr.l.google.com', 'whoami.cloudflare') else ''
+        L.append(f"{ind}DNS {name:<28}: {' | '.join(txts[:3])}{tag}")
+    ntp = dis.get('ntp') or {}
+    if ntp:
+        L.append(f"{ind}NTP readvar : " + '  '.join(f'{k}={v}' for k, v in ntp.items()))
+    pg = dis.get('page') or {}
+    for k, v in pg.items():
+        L.append(f"{ind}Page {k:<8}: {v}")
+    vh = dis.get('vhosts') or {}
+    if vh.get('domains'):
+        L.append(f"{ind}Co-tenant domains on this IP ({len(vh['domains'])}): "
+                 + ', '.join(vh['domains'][:12]) + (' ...' if len(vh['domains']) > 12 else ''))
+    for u in (vh.get('urlscan') or [])[:5]:
+        L.append(f"{ind}urlscan     : {u['domain']}  {u['url']}  ({u['time']})")
+    for n in (dis.get('ct_names') or [])[:14]:
+        L.append(f"{ind}CT hostname : {n}")
+    for h in (dis.get('history') or [])[:8]:
+        L.append(f"{ind}History     : {h['process']} -> :{h['port']} {h['service']}"
+                 + (f" ({h['domain']})" if h['domain'] else '')
+                 + f"  {h['first']} → {h['last']}")
+    vg = dis.get('vpn_gate') or {}
+    for key, title in (('ike1', 'IKEv1'), ('ike2', 'IKEv2')):
+        i = vg.get(key)
+        if i:
+            L.append(f"{ind}{title} responder :{i['port']} — IPsec/VPN gateway confirmed")
+            if i.get('id'):
+                L.append(f"{ind}  declared ID : {i['id']}  (the gateway's own name for itself)")
+            for v in (i.get('vids') or [])[:4]:
+                L.append(f"{ind}  vendor-id   : {v}")
+            for n in (i.get('notify') or [])[:3]:
+                L.append(f"{ind}  notify      : {n}")
+    if vg.get('openvpn'):
+        L.append(f"{ind}OpenVPN       : {vg['openvpn']['opcode']} reply on :1194 — OpenVPN server confirmed")
+    if vg.get('stun'):
+        L.append(f"{ind}TURN/STUN     : {vg['stun']['software']} on :3478 — NAT-traversal/VPN-traversal service")
+    sid = dis.get('selfid') or {}
+    if sid:
+        L.append(f"{ind}Endpoint self-naming ({sum(1 for v in sid.values() if v)} channel(s) answered):")
+        for tag, line in _selfid_lines(sid):
+            L.append(f"{ind}  {tag:<11}: {line}")
+    return L
+
+
+def traceroute_hops(ip: str, max_hops: int = 20, timeout_ms: int = 700) -> list:
+    """Return the router path toward ip as [(hop, address_or_None)]."""
+    try:
+        if _IS_WINDOWS:
+            cmd = ['tracert', '-d', '-h', str(max_hops), '-w', str(timeout_ms), ip]
+        else:
+            cmd = ['traceroute', '-n', '-m', str(max_hops), '-w', '1', ip]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=max_hops * 4 + 10,
+                           creationflags=0x08000000 if _IS_WINDOWS else 0)
+    except Exception as exc:
+        _logger.debug("traceroute failed: %s", exc)
+        return []
+    hops = []
+    for line in r.stdout.splitlines():
+        m = re.match(r'\s*(\d+)\s+(.*)', line)
+        if not m:
+            continue
+        addr = re.findall(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', m.group(2))
+        hops.append((int(m.group(1)), addr[-1] if addr else None))
+    return hops
+
+
+# ========================== ATTRIBUTION ENGINE ==========================
+# Everything below exists to turn "Unknown" into a named, evidenced owner and
+# to carry a reverse trace as far as public, lawful evidence allows. Each
+# source is bounded, cached and degrades to "no answer" — never to a guess
+# presented as fact.
+_TRACE_UA = {'User-Agent': 'MedianBoxMonitor/3.0 (+attribution)'}
+
+
+def _trace_fetch(url: str, timeout: float = 6.0, accept: str = 'application/json',
+                 raw: bool = False):
+    """Bounded GET shared by every attribution source (the one seam tests
+    patch). Returns parsed JSON, or text when raw=True, or None."""
+    try:
+        req = urllib.request.Request(url, headers={**_TRACE_UA, 'Accept': accept})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read(2_000_000)
+        txt = body.decode('utf-8', 'replace')
+        return txt if raw else json.loads(txt)
+    except Exception as exc:
+        _logger.debug("attribution fetch failed %s: %s", url, exc)
+        return None
+
+
+def _trace_public_host(host: str) -> bool:
+    """True only when EVERY address the name resolves to is global — keeps
+    operator-supplied names (certs, RDAP, contact strings) from steering a
+    fetch at this machine's own network."""
+    addrs = _fwd_lookup_bounded(host, 4.0)
+    return bool(addrs) and all(_is_public_ip_cached(a) for a in addrs)
+
+
+# ---------- pure-Python DNS TXT (Team Cymru IP->ASN needs no HTTP) ----------
+_DNS_SERVERS_CACHE = {'ts': 0.0, 'servers': []}
+_DNS_PORT = 53
+
+
+def _system_dns_servers() -> list:
+    """Resolvers this host is configured with, falling back to two public
+    ones only after every configured server has failed to answer."""
+    c = _DNS_SERVERS_CACHE
+    if c['servers'] and time.time() - c['ts'] < 300:
+        return list(c['servers'])
+    found: list = []
+    try:
+        if _IS_WINDOWS:
+            base = r'SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces'
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base) as k:
+                for i in range(winreg.QueryInfoKey(k)[0]):
+                    with winreg.OpenKey(k, winreg.EnumKey(k, i)) as ik:
+                        for val in ('NameServer', 'DhcpNameServer'):
+                            try:
+                                v = winreg.QueryValueEx(ik, val)[0]
+                            except OSError:
+                                continue
+                            found += re.split(r'[,\s]+', (v or '').strip())
+        else:
+            with open('/etc/resolv.conf') as fh:
+                found = [ln.split()[1] for ln in fh
+                         if ln.startswith('nameserver') and len(ln.split()) > 1]
+    except Exception:
+        pass
+    out: list = []
+    for s in found + ['1.1.1.1', '9.9.9.9']:
+        try:
+            a = ipaddress.ip_address(s)
+        except ValueError:
+            continue
+        if s not in out and not a.is_unspecified and not (a.version == 6 and a.is_link_local):
+            out.append(s)
+    c['servers'], c['ts'] = out, time.time()
+    return list(out)
+
+
+def _dns_skip_name(buf: bytes, off: int) -> int:
+    while True:
+        n = buf[off]
+        if n == 0:
+            return off + 1
+        if n & 0xC0 == 0xC0:
+            return off + 2
+        off += n + 1
+
+
+def dns_txt_query(name: str, servers: Optional[list] = None, timeout: float = 2.5) -> list:
+    """Minimal UDP TXT query. Returns the TXT strings (possibly empty)."""
+    try:
+        labels = [l for l in name.rstrip('.').split('.') if l]
+        qid = os.urandom(2)
+        pkt = (qid + b'\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00'
+               + b''.join(bytes([len(l)]) + l.encode('ascii') for l in labels)
+               + b'\x00\x00\x10\x00\x01')
+    except (UnicodeError, ValueError):
+        return []
+    for srv in (servers or _system_dns_servers()):
+        try:
+            fam = socket.AF_INET6 if ':' in srv else socket.AF_INET
+            with socket.socket(fam, socket.SOCK_DGRAM) as s:
+                s.settimeout(timeout)
+                s.sendto(pkt, (srv, _DNS_PORT))
+                while True:
+                    data = s.recvfrom(4096)[0]
+                    if data[:2] == qid:
+                        break
+            if len(data) < 12:
+                continue
+            rcode = data[3] & 0x0F
+            if rcode == 3:
+                return []
+            if rcode:
+                continue
+            qd, an = struct.unpack('!HH', data[4:8])
+            off = 12
+            for _ in range(qd):
+                off = _dns_skip_name(data, off) + 4
+            out = []
+            for _ in range(an):
+                off = _dns_skip_name(data, off)
+                rtype, _cls, _ttl, rdlen = struct.unpack('!HHIH', data[off:off + 10])
+                off += 10
+                rd = data[off:off + rdlen]
+                off += rdlen
+                if rtype == 16:
+                    i, parts = 0, []
+                    while i < len(rd):
+                        ln = rd[i]
+                        parts.append(rd[i + 1:i + 1 + ln].decode('utf-8', 'replace'))
+                        i += 1 + ln
+                    out.append(''.join(parts))
+            return out
+        except (OSError, struct.error, IndexError):
+            continue
+    return []
+
+
+_CYMRU_CACHE: dict = {}
+
+
+def cymru_asn_lookup(ip: str, servers: Optional[list] = None) -> Optional[dict]:
+    """Origin ASN, BGP prefix, registry country and AS holder for an IP from
+    Team Cymru's DNS mapping — an owner source that needs neither GeoIP nor
+    RDAP nor HTTP."""
+    if ip in _CYMRU_CACHE:
+        return _CYMRU_CACHE[ip] or None
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return None
+    if not a.is_global:
+        return None
+    if a.version == 4:
+        qn = '.'.join(reversed(ip.split('.'))) + '.origin.asn.cymru.com'
+    else:
+        qn = '.'.join(reversed(a.exploded.replace(':', ''))) + '.origin6.asn.cymru.com'
+    res: dict = {}
+    txt = dns_txt_query(qn, servers)
+    if txt:
+        p = [x.strip() for x in txt[0].split('|')]
+        asns = p[0].split() if p and p[0] else []
+        if asns:
+            res = {'asn': f'AS{asns[0]}', 'asns': [f'AS{x}' for x in asns],
+                   'prefix': p[1] if len(p) > 1 else '', 'cc': (p[2] if len(p) > 2 else '').upper(),
+                   'rir': p[3] if len(p) > 3 else '', 'allocated': p[4] if len(p) > 4 else '',
+                   'name': ''}
+            nm = dns_txt_query(f'AS{asns[0]}.asn.cymru.com', servers)
+            if nm:
+                q = [x.strip() for x in nm[0].split('|')]
+                if len(q) > 4:
+                    res['name'] = re.sub(r',\s*[A-Z]{2}$', '', q[4]).strip()
+    if len(_CYMRU_CACHE) > 20000:
+        _CYMRU_CACHE.clear()
+    _CYMRU_CACHE[ip] = res
+    return res or None
+
+
+class CymruResolver:
+    """Background wrapper so the scan loop never waits on DNS."""
+    def __init__(self):
+        self._pending: set = set()
+        self._q: "queue.Queue" = queue.Queue(maxsize=500)
+        self._lock = threading.Lock()
+        self._thread: Optional[threading.Thread] = None
+
+    def get(self, ip: str) -> Optional[dict]:
+        if ip in _CYMRU_CACHE:
+            return _CYMRU_CACHE[ip] or None
+        with self._lock:
+            if ip in self._pending:
+                return None
+            self._pending.add(ip)
+            if self._thread is None:
+                self._thread = threading.Thread(target=self._loop, daemon=True, name="Cymru-ASN")
+                self._thread.start()
+        try:
+            self._q.put_nowait(ip)
+        except queue.Full:
+            with self._lock:
+                self._pending.discard(ip)
+        return None
+
+    def _loop(self):
+        while True:
+            ip = self._q.get()
+            try:
+                cymru_asn_lookup(ip)
+            except Exception as exc:
+                _logger.debug("cymru lookup failed %s: %s", ip, exc)
+            with self._lock:
+                self._pending.discard(ip)
+            time.sleep(0.05)
+
+
+def _reverse_ip_lookup(ip: str) -> list:
+    """Passive-DNS reverse-IP: domain names that publicly resolve (or have
+    resolved) to this address. On shared hosting the tenants an IP serves
+    ARE its identity — this names them."""
+    raw = []
+    txt = _trace_fetch(f'https://api.hackertarget.com/reverseiplookup/?q={ip}',
+                       8.0, 'text/plain', raw=True)
+    if isinstance(txt, str):
+        raw += txt.splitlines()
+    data = _trace_fetch(
+        f'https://otx.alienvault.com/api/v1/indicators/IPv4/{ip}/passive_dns', 8.0)
+    if isinstance(data, dict):
+        for row in data.get('passive_dns') or []:
+            v = (row or {}).get('hostname') or ''
+            if isinstance(v, str):
+                raw.append(v)
+    html = _trace_fetch(f'https://rapiddns.io/sameip/{ip}?full=1', 8.0,
+                        'text/html', raw=True)
+    if isinstance(html, str):
+        raw += re.findall(r'<td>([a-z0-9][a-z0-9.-]*\.[a-z]{2,})</td>', html.lower())
+    # CT logs: publicly-trusted certs that name this address (IP-SAN or
+    # identity match) — the certified hostnames are the services it serves.
+    ct = _trace_fetch(f'https://crt.sh/?q={ip}&output=json', 8.0)
+    if isinstance(ct, list):
+        for row in ct[:80]:
+            for nv in str((row or {}).get('name_value') or '').splitlines():
+                raw.append(nv.strip().lstrip('*.'))
+    # urlscan's crawl index: sites observed live on this address.
+    j = _trace_fetch(f'https://urlscan.io/api/v1/search/?q=ip:{ip}&size=50', 8.0)
+    if isinstance(j, dict):
+        for row in (j.get('results') or [])[:40]:
+            v = ((row or {}).get('page') or {}).get('domain') or ''
+            if isinstance(v, str):
+                raw.append(v)
+    # Shodan InternetDB: passive-DNS hostnames observed live on the IP —
+    # free, keyless, and covers shared-host tenants other indexes miss.
+    idb = _internetdb_probe(ip)
+    if isinstance(idb, dict):
+        for v in idb.get('hostnames') or []:
+            if isinstance(v, str):
+                raw.append(v)
+    out = []
+    for n in raw:
+        n = n.strip().lower().rstrip('.')
+        if not n or n in out or ' ' in n or '/' in n:
+            continue
+        if n.startswith(('error', 'no records', 'api count', 'invalid', 'input is')):
+            continue
+        if re.fullmatch(r'(?:[a-z0-9_-]+\.)+[a-z0-9-]{2,}', n):
+            out.append(n)
+    return out[:40]
+
+
+class PassiveDNSReverse:
+    """Background reverse-IP (passive DNS) worker — one lookup per IP,
+    negatives cached too, so the scan loop never blocks on the network."""
+    def __init__(self, min_interval: float = 0.4):
+        self._cache: dict = {}
+        self._pending: set = set()
+        self._q: "queue.Queue" = queue.Queue(maxsize=500)
+        self._lock = threading.Lock()
+        self._thread: Optional[threading.Thread] = None
+        self._min_interval = min_interval
+
+    def get(self, ip: str) -> Optional[list]:
+        hit = self._cache.get(ip)
+        if hit is not None:
+            return hit
+        with self._lock:
+            if ip in self._pending:
+                return None
+            self._pending.add(ip)
+            if self._thread is None:
+                self._thread = threading.Thread(target=self._loop, daemon=True,
+                                                name="PassiveDNS-Rev")
+                self._thread.start()
+        try:
+            self._q.put_nowait(ip)
+        except queue.Full:
+            with self._lock:
+                self._pending.discard(ip)
+        return None
+
+    def _loop(self):
+        while True:
+            ip = self._q.get()
+            try:
+                names = _reverse_ip_lookup(ip)
+            except Exception as exc:
+                _logger.debug("reverse-IP lookup failed %s: %s", ip, exc)
+                names = []
+            # Forward-confirm: a name that still resolves to this IP is
+            # proven co-hosted, not just historically observed.
+            confirmed, deadline = [], time.time() + 6.0
+            for n in names[:8]:
+                if time.time() > deadline:
+                    break
+                try:
+                    if any(a[4][0] == ip for a in socket.getaddrinfo(n, None)):
+                        confirmed.append(n)
+                except Exception:
+                    pass
+                if len(confirmed) >= 3:
+                    break
+            res = {'names': names, 'confirmed': confirmed}
+            with self._lock:
+                if len(self._cache) > 20000:
+                    self._cache.clear()
+                self._cache[ip] = res
+                self._pending.discard(ip)
+            GNAT.record('pdns', dict(res, ip=ip))
+            time.sleep(self._min_interval)
+
+
+class _SkipTcp(Exception):
+    """Internal: skip the TCP probe for a UDP-socketed entry."""
+
+
+class SelfIdentProbe:
+    """Background worker for self-naming endpoint probes (NBNS node-status,
+    SNMP sysName, NTP, SSDP, SSRP; mDNS PTR on LAN peers). A host that
+    answers any of these names itself — ground truth the endpoint chose
+    to publish, which also unmasks misconfigured VPN exits."""
+    def __init__(self):
+        self._cache: dict = {}
+        self._pending: set = set()
+        self._q: "queue.Queue" = queue.Queue(maxsize=500)
+        self._lock = threading.Lock()
+        self._thread: Optional[threading.Thread] = None
+        self._mv = MultiVerifier()
+
+    def get(self, ip: str, port: int = 0, proto: str = 'tcp') -> Optional[dict]:
+        hit = self._cache.get(ip)
+        if hit is not None:
+            return hit
+        with self._lock:
+            if ip in self._pending:
+                return None
+            self._pending.add(ip)
+            if self._thread is None:
+                self._thread = threading.Thread(target=self._loop, daemon=True,
+                                                name="SelfIdent")
+                self._thread.start()
+        try:
+            self._q.put_nowait((ip, port, proto))
+        except queue.Full:
+            with self._lock:
+                self._pending.discard(ip)
+        return None
+
+    def _loop(self):
+        while True:
+            ip, port, proto = self._q.get()
+            try:
+                res = self._mv._identity_probe(ip) or {}
+            except Exception as exc:
+                _logger.debug("self-ident probe failed %s: %s", ip, exc)
+                res = {}
+            try:
+                kind = special_range_info(ip).get('kind')
+                if kind in ('private', 'linklocal', 'cgn'):
+                    names = _mdns_ptr(ip)
+                    if names:
+                        res['mdns_names'] = names
+            except Exception:
+                pass
+            # Protocol fingerprints + TCP banner/HTTP on the observed port
+            # — a live IKE_SA_INIT or OpenVPN handshake reply names the VPN
+            # service itself; the stack's own greeting names the rest.
+            if port:
+                try:
+                    if proto == 'udp' or port in _VPN_UDP_PORTS:
+                        vu = _vpn_udp_probe(ip, port)
+                        if vu:
+                            res['vpn_udp'] = vu
+                    if proto == 'udp':
+                        raise _SkipTcp
+                    r = _tcp_probe(ip, port, send=None)
+                    guess = _banner_guess(r.get('banner') or b'')
+                    if guess:
+                        res['banner_guess'] = guess
+                        res['banner_port'] = port
+                    if (port in _HTTP_PROBE_PORTS
+                            or (r.get('banner') or b'').startswith(b'HTTP/')):
+                        hp = _http_probe(ip, port)
+                        if hp.get('open'):
+                            res['http'] = hp
+                            pg = _page_probe(ip, port)
+                            if pg:
+                                res['page'] = pg
+                except _SkipTcp:
+                    pass
+                except Exception:
+                    pass
+            with self._lock:
+                if len(self._cache) > 20000:
+                    self._cache.clear()
+                self._cache[ip] = res
+                self._pending.discard(ip)
+            GNAT.record('selfident', dict(res, ip=ip, port=port))
+            time.sleep(0.25)
+
+
+# ---------- provider-published address ranges ----------
+class ProviderRangeDB:
+    """Longest-prefix lookup over the address ranges cloud/CDN operators
+    publish themselves. Turns the generic registry owner "Amazon AWS" into
+    "AWS CloudFront (edge)" or "AWS EC2 us-east-1". Fetched at most once per
+    TTL on a background thread, cached on disk; a failed fetch keeps the
+    last good copy."""
+    _FEEDS = (
+        ('aws', 'https://ip-ranges.amazonaws.com/ip-ranges.json'),
+        ('gcp', 'https://www.gstatic.com/ipranges/cloud.json'),
+        ('cloudflare4', 'https://www.cloudflare.com/ips-v4'),
+        ('cloudflare6', 'https://www.cloudflare.com/ips-v6'),
+        ('github', 'https://api.github.com/meta'),
+        ('fastly', 'https://api.fastly.com/public-ip-list'),
+        ('oracle', 'https://docs.oracle.com/iaas/tools/public_ip_ranges.json'),
+    )
+    _AWS_PRETTY = {'CLOUDFRONT': 'CloudFront', 'EC2': 'EC2', 'S3': 'S3', 'ROUTE53': 'Route 53',
+                   'GLOBALACCELERATOR': 'Global Accelerator', 'API_GATEWAY': 'API Gateway',
+                   'CLOUDFRONT_ORIGIN_FACING': 'CloudFront origin', 'AMAZON': 'AWS',
+                   'ROUTE53_HEALTHCHECKS': 'Route 53 health checks', 'WORKSPACES_GATEWAYS':
+                   'WorkSpaces', 'CHIME_VOICECONNECTOR': 'Chime', 'DYNAMODB': 'DynamoDB'}
+    _CDN = frozenset({'cloudfront', 'cloudflare', 'fastly'})
+
+    def __init__(self, path: Optional[str] = None, ttl: Optional[float] = None):
+        self._path = path
+        self._ttl = ttl
+        self._nets: dict = {4: {}, 6: {}}
+        self._lens: dict = {4: [], 6: []}
+        self._lock = threading.Lock()
+        self._ts = 0.0
+        self._started = False
+        self.count = 0
+
+    def _cfg_path(self) -> str:
+        return self._path or CONFIG.get('attribution_provider_ranges_file', 'medianbox_provider_ranges.json')
+
+    def _cfg_ttl(self) -> float:
+        return self._ttl or CONFIG.get('attribution_provider_ranges_ttl_s', 86400)
+
+    def _add(self, cidr: str, provider: str, service: str, region: str, prio: int = 2) -> bool:
+        try:
+            net = ipaddress.ip_network(cidr, strict=False)
+        except ValueError:
+            return False
+        v, pl = net.version, net.prefixlen
+        key = int(net.network_address)
+        bucket = self._nets[v].setdefault(pl, {})
+        old = bucket.get(key)
+        if old is not None and old['prio'] >= prio:
+            return False
+        bucket[key] = {'provider': provider, 'service': service, 'region': region, 'prio': prio}
+        if pl not in self._lens[v]:
+            self._lens[v] = sorted(self._lens[v] + [pl], reverse=True)
+        return True
+
+    def ingest(self, source: str, data) -> int:
+        """Parse one feed payload (parsed JSON, or text for the plain lists)."""
+        n = 0
+        try:
+            if source == 'aws':
+                for p in data.get('prefixes', []):
+                    svc = p.get('service', 'AMAZON')
+                    n += self._add(p['ip_prefix'], 'AWS', self._AWS_PRETTY.get(svc, svc.title()),
+                                   p.get('region', ''), 1 if svc == 'AMAZON' else (2 if svc == 'EC2' else 3))
+                for p in data.get('ipv6_prefixes', []):
+                    svc = p.get('service', 'AMAZON')
+                    n += self._add(p['ipv6_prefix'], 'AWS', self._AWS_PRETTY.get(svc, svc.title()),
+                                   p.get('region', ''), 1 if svc == 'AMAZON' else (2 if svc == 'EC2' else 3))
+            elif source == 'gcp':
+                for p in data.get('prefixes', []):
+                    n += self._add(p.get('ipv4Prefix') or p.get('ipv6Prefix') or '', 'Google Cloud',
+                                   p.get('service', 'Cloud'), p.get('scope', ''))
+            elif source in ('cloudflare4', 'cloudflare6'):
+                for ln in str(data).split():
+                    n += self._add(ln.strip(), 'Cloudflare', 'edge', '', 3)
+            elif source == 'github':
+                for svc, lst in data.items():
+                    if isinstance(lst, list) and svc in ('web', 'api', 'git', 'hooks', 'actions', 'pages',
+                                                         'packages', 'importer', 'copilot', 'dependabot'):
+                        for c in lst:
+                            n += self._add(c, 'GitHub', svc, '', 3)
+            elif source == 'fastly':
+                for c in data.get('addresses', []) + data.get('ipv6_addresses', []):
+                    n += self._add(c, 'Fastly', 'edge', '', 3)
+            elif source == 'oracle':
+                for reg in data.get('regions', []):
+                    for c in reg.get('cidrs', []):
+                        n += self._add(c.get('cidr', ''), 'Oracle Cloud',
+                                       '/'.join(c.get('tags', [])[:1]) or 'OCI', reg.get('region', ''))
+        except (AttributeError, KeyError, TypeError):
+            pass
+        self.count += n
+        return n
+
+    def lookup(self, ip: str) -> Optional[dict]:
+        try:
+            a = ipaddress.ip_address(ip)
+        except ValueError:
+            return None
+        bits = 32 if a.version == 4 else 128
+        iv = int(a)
+        for pl in self._lens[a.version]:
+            hit = self._nets[a.version].get(pl, {}).get((iv >> (bits - pl)) << (bits - pl))
+            if hit:
+                prov, svc, reg = hit['provider'], hit['service'], hit['region']
+                cdn = (prov.lower() in self._CDN or svc.lower() in self._CDN)
+                label = prov if svc in ('', 'edge', 'AWS') and prov != 'Cloudflare' else f"{prov} {svc}"
+                if prov == 'Cloudflare':
+                    label = 'Cloudflare edge'
+                elif prov == 'Fastly':
+                    label = 'Fastly edge'
+                if reg and reg.upper() != 'GLOBAL':
+                    label += f" ({reg})"
+                return {'provider': prov, 'service': svc, 'region': reg, 'label': label,
+                        'category': 'CDN' if cdn else ('Dev' if prov == 'GitHub' else 'Cloud/Hosting')}
+        return None
+
+    def load_disk(self) -> bool:
+        try:
+            with open(self._cfg_path(), encoding='utf-8') as fh:
+                st = json.load(fh)
+            for row in st.get('rows', []):
+                self._add(*row)
+            self._ts = st.get('ts', 0.0)
+            self.count = sum(len(b) for v in self._nets.values() for b in v.values())
+            return bool(self.count)
+        except Exception:
+            return False
+
+    def _save_disk(self) -> None:
+        try:
+            rows = [[f"{ipaddress.ip_address(k)}/{pl}", m['provider'], m['service'], m['region'], m['prio']]
+                    for v in (4, 6) for pl, b in self._nets[v].items() for k, m in b.items()]
+            tmp = self._cfg_path() + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as fh:
+                json.dump({'ts': self._ts, 'rows': rows}, fh)
+            os.replace(tmp, self._cfg_path())
+        except Exception as exc:
+            _logger.debug("provider range save failed: %s", exc)
+
+    def refresh(self) -> int:
+        n = 0
+        for name, url in self._FEEDS:
+            raw = name.startswith('cloudflare')
+            data = _trace_fetch(url, timeout=15.0, raw=raw, accept='text/plain' if raw else 'application/json')
+            if data:
+                n += self.ingest(name, data)
+        if n:
+            self._ts = time.time()
+            self._save_disk()
+        return n
+
+    def _bg(self):
+        self.load_disk()
+        if time.time() - self._ts >= self._cfg_ttl() and CONFIG.get('geoip_enabled', True):
+            self.refresh()
+
+    def ensure(self, block: bool = False) -> None:
+        """Warm from disk and refresh when stale; background by default."""
+        with self._lock:
+            if self._started:
+                return
+            self._started = True
+        if block:
+            self._bg()
+        else:
+            threading.Thread(target=self._bg, daemon=True, name="Provider-Ranges").start()
+
+
+PROVIDER_RANGES = ProviderRangeDB()
+
+
+# ---------- address classes that need no lookup ----------
+_SPECIAL_V4 = tuple((ipaddress.ip_network(n), kind, label) for n, kind, label in (
+    ('127.0.0.0/8', 'loopback', 'Loopback'),
+    ('169.254.0.0/16', 'linklocal', 'Link-local / APIPA (no DHCP answer)'),
+    ('100.64.0.0/10', 'cgn', 'Carrier-grade NAT shared address (ISP / Tailscale range)'),
+    ('198.18.0.0/15', 'benchmark', 'Benchmark/test network (RFC 2544)'),
+    ('192.0.2.0/24', 'documentation', 'Documentation range (TEST-NET-1)'),
+    ('198.51.100.0/24', 'documentation', 'Documentation range (TEST-NET-2)'),
+    ('203.0.113.0/24', 'documentation', 'Documentation range (TEST-NET-3)'),
+    ('192.0.0.0/24', 'ietf', 'IETF protocol assignment'),
+    ('192.88.99.0/24', 'ietf', '6to4 relay anycast (deprecated)'),
+    ('0.0.0.0/8', 'unspecified', 'This-network / unspecified'),
+    ('240.0.0.0/4', 'reserved', 'Reserved (class E)'),
+    ('10.0.0.0/8', 'private', 'Private network (RFC 1918)'),
+    ('172.16.0.0/12', 'private', 'Private network (RFC 1918)'),
+    ('192.168.0.0/16', 'private', 'Private network (RFC 1918)'),
+))
+_MCAST_NAMES = {
+    '224.0.0.1': 'All-hosts multicast', '224.0.0.2': 'All-routers multicast',
+    '224.0.0.22': 'IGMPv3 membership reports', '224.0.0.251': 'mDNS (Bonjour/Avahi) multicast',
+    '224.0.0.252': 'LLMNR multicast', '239.255.255.250': 'SSDP/UPnP discovery multicast',
+    '255.255.255.255': 'Limited broadcast', 'ff02::1': 'All-nodes multicast',
+    'ff02::2': 'All-routers multicast', 'ff02::fb': 'mDNS multicast',
+    'ff02::1:3': 'LLMNR multicast', 'ff02::c': 'SSDP/UPnP discovery multicast',
+    'ff02::16': 'MLDv2 reports', 'ff02::1:2': 'DHCPv6 servers multicast',
+}
+
+
+_SPECIAL_INFO_CACHE: dict = {}
+
+
+def special_range_info(ip: str) -> dict:
+    """Name every non-public address class, and decode the IPv4 address that
+    IPv4-mapped / 6to4 / Teredo / NAT64 forms carry inside themselves.
+    kind == '' means an ordinary public address. Memoized — called per
+    connection per scan and the result for a given address never changes."""
+    hit = _SPECIAL_INFO_CACHE.get(ip)
+    if hit is not None:
+        return dict(hit)
+    out = {'kind': '', 'label': '', 'category': 'Local', 'icon': '🏠', 'embedded': ''}
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return out
+    if a.version == 6:
+        if a.ipv4_mapped:
+            out.update(kind='mapped', embedded=str(a.ipv4_mapped), icon='🔁',
+                       label=f'IPv4-mapped IPv6 form of {a.ipv4_mapped}')
+        elif a.sixtofour:
+            out.update(kind='6to4', embedded=str(a.sixtofour), icon='🔁',
+                       label=f'6to4 tunnel address embedding public IPv4 {a.sixtofour}')
+        elif a.teredo:
+            srv, cli = a.teredo
+            out.update(kind='teredo', embedded=str(cli), icon='🔁',
+                       label=f'Teredo tunnel (server {srv}, client IPv4 {cli})')
+        elif a in ipaddress.ip_network('64:ff9b::/96'):
+            emb = ipaddress.IPv4Address(int(a) & 0xFFFFFFFF)
+            out.update(kind='nat64', embedded=str(emb), icon='🔁',
+                       label=f'NAT64 form of IPv4 {emb}')
+        elif a.is_loopback:
+            out.update(kind='loopback', label='Loopback')
+        elif a.is_link_local:
+            out.update(kind='linklocal', label='IPv6 link-local neighbour')
+        elif a.is_multicast:
+            out.update(kind='multicast', icon='📡', label=_MCAST_NAMES.get(str(a), f'IPv6 multicast {a}'))
+        elif a.is_unspecified:
+            out.update(kind='unspecified', label='Unspecified address')
+        elif a.is_private:
+            out.update(kind='private', label='IPv6 unique-local/private network')
+    else:
+        if str(a) in _MCAST_NAMES:
+            out.update(kind='multicast', icon='📡', label=_MCAST_NAMES[str(a)])
+        elif a.is_multicast:
+            out.update(kind='multicast', icon='📡', label=f'IPv4 multicast group {a}')
+        else:
+            for net, kind, label in _SPECIAL_V4:
+                if a in net:
+                    out.update(kind=kind, label=label)
+                    break
+    if len(_SPECIAL_INFO_CACHE) > 16384:
+        _SPECIAL_INFO_CACHE.clear()
+    _SPECIAL_INFO_CACHE[ip] = dict(out)
+    return out
+
+
+_LAN_PORT_HINTS = {8009: 'Google Cast', 8008: 'Google Cast', 7680: 'Windows Update-sharing',
+                   9100: 'network printer', 631: 'IPP printer', 515: 'LPD printer', 554: 'RTSP camera/NVR',
+                   1900: 'UPnP', 5353: 'mDNS', 445: 'SMB file share', 139: 'NetBIOS', 548: 'AFP file share',
+                   3389: 'RDP', 22: 'SSH', 5000: 'UPnP/NAS', 8060: 'Roku', 3000: 'Roku/media',
+                   1400: 'Sonos', 9000: 'media server', 32400: 'Plex', 8096: 'Jellyfin', 62078: 'Apple iOS sync',
+                   49152: 'UPnP', 5357: 'WSD', 3702: 'WSD discovery'}
+
+
+def lan_known_role(svc: str) -> bool:
+    return svc.startswith(('Gateway/router', 'VPN-tunnel'))
+
+
+class LanIdentity:
+    """Names private-network peers from the OS neighbour (ARP) table: MAC,
+    vendor from the OUI, gateway role, and whether the MAC is the randomised
+    per-network address modern phones/PCs use. Refreshed in the background."""
+    _ARP_WIN = re.compile(r'^\s*(\d+\.\d+\.\d+\.\d+)\s+((?:[0-9a-f]{2}-){5}[0-9a-f]{2})\s+\w+', re.I | re.M)
+    _ARP_NIX = re.compile(r'\((\d+\.\d+\.\d+\.\d+)\)\s+at\s+((?:[0-9a-f]{1,2}:){5}[0-9a-f]{1,2})', re.I)
+    _NEIGH_NIX = re.compile(r'^(\S+)\s+dev\s+\S+\s+lladdr\s+((?:[0-9a-f]{2}:){5}[0-9a-f]{2})', re.I | re.M)
+
+    def __init__(self, ttl: float = 60.0):
+        self._neigh: dict = {}
+        self._gw = ''
+        self._ts = 0.0
+        self._busy = False
+        self._ttl = ttl
+        self._lock = threading.Lock()
+
+    @classmethod
+    def parse_neighbours(cls, text: str) -> dict:
+        out = {}
+        for rx in (cls._ARP_WIN, cls._ARP_NIX, cls._NEIGH_NIX):
+            for ip, mac in rx.findall(text or ''):
+                mac = ':'.join(f'{int(p, 16):02x}' for p in re.split(r'[-:]', mac))
+                if mac in ('ff:ff:ff:ff:ff:ff', '00:00:00:00:00:00') or mac.startswith('01:00:5e') \
+                        or mac.startswith('33:33'):
+                    continue
+                out[ip] = mac
+        return out
+
+    @staticmethod
+    def parse_gateway(text: str) -> str:
+        m = re.search(r'^\s*0\.0\.0\.0\s+0\.0\.0\.0\s+(\d+\.\d+\.\d+\.\d+)', text or '', re.M) \
+            or re.search(r'default via (\S+)', text or '')
+        return m.group(1) if m else ''
+
+    def refresh(self) -> None:
+        def run(cmd):
+            try:
+                return subprocess.run(cmd, capture_output=True, text=True, timeout=8,
+                                      creationflags=_CREATE_NO_WINDOW).stdout
+            except Exception:
+                return ''
+        neigh = self.parse_neighbours(run(['arp', '-a']))
+        if not _IS_WINDOWS:
+            neigh.update(self.parse_neighbours(run(['ip', 'neigh'])))
+        gw = self.parse_gateway(run(['route', 'print', '-4'] if _IS_WINDOWS else ['ip', 'route']))
+        with self._lock:
+            self._neigh, self._gw, self._ts, self._busy = neigh, gw, time.time(), False
+
+    def poke(self) -> None:
+        with self._lock:
+            if self._busy or time.time() - self._ts < self._ttl:
+                return
+            self._busy = True
+        threading.Thread(target=self.refresh, daemon=True, name="LAN-Identity").start()
+
+    def identify(self, ip: str) -> dict:
+        self.poke()
+        mac = self._neigh.get(ip, '')
+        rand = bool(mac) and bool(int(mac[1], 16) & 2)
+        vendor = ''
+        if mac and not rand:
+            v = get_vendor(mac)
+            vendor = '' if v.startswith('Unknown') else v
+        return {'mac': mac, 'vendor': vendor, 'randomized_mac': rand,
+                'gateway': bool(ip) and ip == self._gw}
+
+
+# Processes whose network peers are, by construction, one vendor's backend —
+# used ONLY to name a shared CDN/cloud edge the process is talking to, and
+# always labelled "inferred" so it is never mistaken for wire evidence.
+_APP_BACKENDS = {
+    'chatgpt.exe': 'OpenAI', 'codex.exe': 'OpenAI', 'discord.exe': 'Discord',
+    'riotclientservices.exe': 'Riot Games', 'riotclientux.exe': 'Riot Games',
+    'onedrive.exe': 'Microsoft OneDrive', 'copilotapp.exe': 'Microsoft Copilot',
+    'spotify.exe': 'Spotify', 'steam.exe': 'Steam', 'steamwebhelper.exe': 'Steam',
+    'slack.exe': 'Slack', 'ms-teams.exe': 'Microsoft Teams', 'teams.exe': 'Microsoft Teams',
+    'zoom.exe': 'Zoom', 'dropbox.exe': 'Dropbox', 'epicgameslauncher.exe': 'Epic Games',
+    'language_server_windows_x64.exe': 'Codeium/Windsurf', 'devin.exe': 'Devin/Cognition',
+    'nvcontainer.exe': 'NVIDIA', 'mpdefendercoreservice.exe': 'Microsoft Defender',
+    'googledrivefs.exe': 'Google Drive', 'telegram.exe': 'Telegram', 'signal.exe': 'Signal',
+}
+_GENERIC_MAIL_DOMAINS = frozenset({
+    'gmail.com', 'googlemail.com', 'outlook.com', 'hotmail.com', 'live.com', 'yahoo.com',
+    'proton.me', 'protonmail.com', 'pm.me', 'tutanota.com', 'tuta.io', 'tutamail.com',
+    'riseup.net', 'icloud.com', 'me.com', 'gmx.com', 'gmx.net', 'gmx.de', 'mail.com',
+    'aol.com', 'qq.com', 'yandex.ru', 'yandex.com', 'mail.ru', 'fastmail.com', 'zoho.com',
+})
+_SLD_LABELS = frozenset({'co', 'com', 'org', 'net', 'gov', 'edu', 'ac', 'or', 'ne', 'go'})
+
+
+def _registrable_domain(host: str) -> str:
+    parts = (host or '').lower().strip('.').split('.')
+    if len(parts) <= 2:
+        return '.'.join(parts)
+    if len(parts[-1]) == 2 and parts[-2] in _SLD_LABELS:
+        return '.'.join(parts[-3:])
+    return '.'.join(parts[-2:])
+
+
+def _extract_contact_domains(text: str) -> list:
+    """Domains from an e-mail/URL string, including the 'name AT host DOT tld'
+    obfuscation Tor relay operators use in their ContactInfo."""
+    t = re.sub(r'\s*[\[\(<{]\s*at\s*[\]\)>}]\s*|\s+at\s+|\[\s*\]', '@', text or '', flags=re.I)
+    t = re.sub(r'\s*[\[\(<{]\s*dot\s*[\]\)>}]\s*|\s+dot\s+', '.', t, flags=re.I)
+    out = []
+    for h in re.findall(r'[\w.+-]+@([\w-]+(?:\.[\w-]+)+)', t) + re.findall(r'https?://([\w.-]+)', t):
+        d = _registrable_domain(h)
+        if d and d not in out:
+            out.append(d)
+    return out
+
+
+def _parse_security_txt(text: str) -> dict:
+    out: dict = {}
+    for ln in (text or '').splitlines():
+        if ln.startswith('#') or ':' not in ln:
+            continue
+        k, _, v = ln.partition(':')
+        k = k.strip().lower()
+        if k in ('contact', 'policy', 'expires', 'acknowledgments', 'encryption', 'canonical',
+                 'preferred-languages', 'hiring'):
+            out.setdefault(k, []).append(v.strip())
+    return out
+
+
+_RIR_RDAP = {'arin': 'https://rdap.arin.net/registry/ip/{ip}', 'ripencc': 'https://rdap.db.ripe.net/ip/{ip}',
+             'apnic': 'https://rdap.apnic.net/ip/{ip}', 'lacnic': 'https://rdap.lacnic.net/rdap/ip/{ip}',
+             'afrinic': 'https://rdap.afrinic.net/rdap/ip/{ip}'}
+
+
+def _trace_local_owners(ip: str) -> list:
+    """Reverse trace on THIS host: which local process holds a socket to ip."""
+    rows = []
+    try:
+        for c in psutil.net_connections(kind='inet'):
+            if c.raddr and c.raddr[0] == ip:
+                row = {'pid': c.pid or 0, 'status': c.status,
+                       'local': f"{c.laddr[0]}:{c.laddr[1]}" if c.laddr else '',
+                       'remote_port': c.raddr[1], 'proto': 'TCP' if c.type == 1 else 'UDP',
+                       'process': '', 'exe': '', 'started': '', 'cmdline': ''}
+                if c.pid:
+                    try:
+                        p = psutil.Process(c.pid)
+                        row.update(process=p.name(), exe=p.exe() or '',
+                                   started=datetime.datetime.fromtimestamp(p.create_time()).isoformat(timespec='seconds'),
+                                   cmdline=' '.join(p.cmdline())[:200])
+                    except (psutil.Error, OSError):
+                        pass
+                rows.append(row)
+    except (psutil.Error, OSError) as exc:
+        _logger.debug("trace local owners failed: %s", exc)
+    return rows[:20]
+
+
+def _nat_sessions(ip: str) -> list:
+    """NAT/conntrack table of THIS host: when this machine masquerades for
+    LAN clients, it is the operator and the table maps public flows back to
+    the real client. Linux conntrack first, then Windows WinNAT sessions."""
+    rows = []
+    try:
+        with open('/proc/net/nf_conntrack', encoding='ascii', errors='ignore') as fh:
+            for line in fh:
+                if ip not in line:
+                    continue
+                m = re.search(r'src=(\S+) dst=(\S+) sport=(\S+) dport=(\S+).*?'
+                              r'src=(\S+) dst=(\S+) sport=(\S+) dport=(\S+)', line)
+                if not m:
+                    continue
+                o_src, o_dst, o_sp, o_dp, r_src, r_dst, r_sp, r_dp = m.groups()
+                if o_dst == ip:
+                    rows.append({'direction': 'outbound', 'lan_client': o_src,
+                                 'lan_port': o_sp, 'target': o_dst, 'target_port': o_dp,
+                                 'nat_side': f"{r_dst}:{r_dp}"})
+                elif o_src == ip:
+                    rows.append({'direction': 'inbound', 'lan_client': r_dst,
+                                 'lan_port': r_dp, 'target': o_src, 'target_port': o_dp,
+                                 'nat_side': f"{o_dst}:{o_dp}"})
+    except OSError:
+        pass
+    if not rows and os.name == 'nt':
+        try:
+            out = subprocess.run(
+                ['powershell', '-NoProfile', '-Command',
+                 'Get-NetNatSession -ErrorAction SilentlyContinue | '
+                 'ConvertTo-Csv -NoTypeInformation'],
+                capture_output=True, text=True, timeout=10,
+                creationflags=_CREATE_NO_WINDOW).stdout
+            import csv, io
+            for r in csv.DictReader(io.StringIO(out)):
+                if r.get('DestinationAddress') == ip or r.get('SourceAddress') == ip:
+                    rows.append({'direction': 'nat',
+                                 'lan_client': r.get('SourceAddress', ''),
+                                 'lan_port': r.get('SourcePort', ''),
+                                 'target': r.get('DestinationAddress', ''),
+                                 'target_port': r.get('DestinationPort', ''),
+                                 'nat_side': r.get('NatExternalAddress', '')})
+        except Exception:
+            pass
+    return rows[:25]
+
+
+def _dhcp_lease_for(ip: str) -> list:
+    """DHCP lease files on THIS host (when it is a LAN DHCP server, e.g. a
+    dnsmasq/ISC-based router): MAC + hostname the client told us itself."""
+    rows = []
+    paths = ['/var/lib/misc/dnsmasq.leases', '/var/lib/dhcpd/dhcpd.leases',
+             '/var/lib/dhcp/dhcpd.leases', '/var/db/dhcpd.leases']
+    try:
+        import glob as _g
+        paths += _g.glob('/var/lib/NetworkManager/dnsmasq-*.leases')
+    except Exception:
+        pass
+    for p in paths:
+        try:
+            text = open(p, encoding='utf-8', errors='ignore').read()
+        except OSError:
+            continue
+        for line in text.splitlines():
+            f = line.split()
+            # dnsmasq: <expiry> <mac> <ip> <hostname> <client-id>
+            if len(f) >= 4 and f[2] == ip and re.fullmatch(r'[0-9a-fA-F:]{17}', f[1]):
+                rows.append({'mac': f[1].lower(), 'hostname': f[3] if f[3] != '*' else '',
+                             'source': p})
+        for m in re.finditer(
+                r'lease\s+' + re.escape(ip) + r'\s*\{(.*?)\}', text, re.S):
+            body = m.group(1)
+            mac = re.search(r'hardware\s+ethernet\s+([0-9a-fA-F:]{17})', body)
+            host = re.search(r'client-hostname\s+"([^"]*)"', body)
+            rows.append({'mac': mac.group(1).lower() if mac else '',
+                         'hostname': host.group(1) if host else '', 'source': p})
+    seen, out = set(), []
+    for r in rows:
+        k = (r['mac'], r['hostname'])
+        if k not in seen:
+            seen.add(k)
+            out.append(r)
+    return out[:10]
+
+
+def _operator_side_trace(ip: str) -> dict:
+    """The 'unmask' step, at the one place it can actually run: the operator.
+    When THIS host terminates tunnels/proxies, the tunnel's peer IS the
+    pre-tunnel client — visible in the socket table, the NAT/conntrack
+    table, tunnel interfaces and DHCP leases. On a host that is not the
+    operator for `ip` this reports that, plus where to continue instead."""
+    out = {'role': [], 'is_client': False, 'client_sessions': [],
+           'service_sessions': [], 'nat': [], 'leases': []}
+    try:
+        conns = psutil.net_connections(kind='all')
+    except (psutil.Error, OSError):
+        conns = []
+    try:
+        if MedianBoxMonitor._detect_ip_forward():
+            out['role'].append('IP forwarding enabled (router/NAT role)')
+    except Exception:
+        pass
+    try:
+        ifaces = MedianBoxMonitor._tunnel_iface_names(psutil.net_if_addrs())
+        if ifaces:
+            out['role'].append('tunnel interfaces: ' + ', '.join(ifaces[:6]))
+    except Exception:
+        pass
+    try:
+        listeners, clients = MedianBoxMonitor._gateway_extract(conns)
+    except Exception:
+        listeners, clients = [], {}
+    if listeners:
+        out['role'].append('VPN server listeners: ' + ', '.join(
+            f"{l['proto']} :{l['port']} pid {l.get('pid', 0)}" for l in listeners[:8]))
+    for (lport, rip), ent in clients.items():
+        if rip == ip:
+            out['is_client'] = True
+            out['client_sessions'].append({
+                'proto': ent['proto'], 'listener_port': ent['lport'],
+                'client_port': ent.get('port') or 0, 'packets': ent.get('pkts', 0),
+                'first_seen': datetime.datetime.fromtimestamp(ent['first']).isoformat(timespec='seconds'),
+                'last_seen': datetime.datetime.fromtimestamp(ent['last']).isoformat(timespec='seconds')})
+    listen_ports = set()
+    for c in conns:
+        try:
+            if c.status == 'LISTEN' and c.laddr:
+                listen_ports.add(c.laddr.port)
+        except Exception:
+            continue
+    for c in conns:
+        try:
+            if not (c.raddr and c.raddr.ip == ip and c.laddr):
+                continue
+            lp = c.laddr.port
+            if lp in listen_ports or lp in _VPN_SERVER_PORTS:
+                out['service_sessions'].append({
+                    'proto': 'TCP' if c.type == socket.SOCK_STREAM else 'UDP',
+                    'listener_port': lp, 'client_port': c.raddr.port,
+                    'status': c.status, 'pid': c.pid or 0})
+        except Exception:
+            continue
+    out['nat'] = _nat_sessions(ip)
+    out['leases'] = _dhcp_lease_for(ip)
+    return out
+
+
+def _render_operator_side(oside: dict, ind: str) -> list:
+    L = [ind + "-" * 60,
+         ind + "OPERATOR-SIDE TRACE — 'unmasking' runs where the tunnel ends"]
+    if oside['role']:
+        L.append(f"{ind}This host   : " + '  |  '.join(oside['role']))
+    else:
+        L.append(f"{ind}This host   : no tunnel listeners, no IP forwarding — not the "
+                 f"operator for this target")
+    for s in oside.get('client_sessions', []):
+        L.append(f"{ind}CLIENT      : target IS a tunnel client of this host — {s['proto']} "
+                 f":{s['listener_port']} from port {s['client_port']} "
+                 f"({s['packets']} pkts, {s['first_seen']} → {s['last_seen']})")
+    for s in oside.get('service_sessions', []):
+        L.append(f"{ind}Client of   : local service :{s['listener_port']} ({s['proto']}, "
+                 f"{s['status']}, client port {s['client_port']}, server PID {s['pid']})")
+    for n in oside.get('nat', []):
+        L.append(f"{ind}NAT table   : {n['direction']} {n['lan_client']}:{n['lan_port']} "
+                 f"→ {n['target']}:{n['target_port']}  (public side {n['nat_side']})")
+    for le in oside.get('leases', []):
+        L.append(f"{ind}DHCP lease  : MAC {le['mac']}" +
+                 (f"  hostname '{le['hostname']}'" if le['hostname'] else '') +
+                 f"  ({le['source']})")
+    unmasked = bool(oside.get('client_sessions') or oside.get('nat') or oside.get('leases'))
+    if unmasked:
+        L.append(f"{ind}=> The pre-tunnel identity above IS the client — visible because this")
+        L.append(f"{ind}   host is the operator: the tunnel/proxy terminates here.")
+    else:
+        L.append(f"{ind}=> This host cannot see a client behind the target. The client-side")
+        L.append(f"{ind}   record exists only on the operator's machines — run this monitor")
+        L.append(f"{ind}   ON the operator host and this section resolves the client there,")
+        L.append(f"{ind}   or send the records-request draft (--trace-draft FILE) to the")
+        L.append(f"{ind}   operator's contact listed in the report.")
+    return L
+
+
+def _trace_path(ip: str, target_asn: str) -> dict:
+    """Traceroute annotated with AS holder + rDNS per hop; marks the border
+    hop where the path enters the target's AS (the operator's edge)."""
+    from concurrent.futures import ThreadPoolExecutor
+    hops = traceroute_hops(ip)
+
+    def work(h):
+        n, a = h
+        r = {'hop': n, 'ip': a, 'rdns': '', 'asn': '', 'name': '', 'hint': ''}
+        if a and _is_public_ip_cached(a):
+            r['rdns'] = _rdns_bounded(a, 2.0)
+            c = cymru_asn_lookup(a) or {}
+            r['asn'], r['name'] = c.get('asn', ''), c.get('name', '')
+            for tok in re.split(r'[.\-_0-9]+', r['rdns'].lower()):
+                if len(tok) == 3 and tok in _RDNS_CITY_CODES:
+                    r['hint'] = _RDNS_CITY_CODES[tok][0]
+                    break
+        return r
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        rows = list(ex.map(work, hops))
+    border = next((r['hop'] for r in rows if target_asn and r['asn'] == target_asn), None)
+    asn_path: list = []
+    for r in rows:
+        if r['asn'] and (not asn_path or asn_path[-1] != r['asn']):
+            asn_path.append(r['asn'])
+    return {'hops': rows, 'border_hop': border, 'asn_path': asn_path,
+            'reached': bool(rows) and rows[-1]['ip'] == ip}
+
+
+def _trace_tor(ip: str) -> Optional[dict]:
+    """Tor Project relay directory: nickname, fingerprint, operator contact
+    string and relay family — all published by the relay operators."""
+    data = _trace_fetch('https://onionoo.torproject.org/details?search=' + ip + '&limit=5', timeout=8.0)
+    for r in ((data or {}).get('relays') or []):
+        addrs = [a.rsplit(':', 1)[0].strip('[]') for a in (r.get('or_addresses') or [])]
+        if ip not in addrs and ip not in (r.get('exit_addresses') or []):
+            continue
+        out = {'nickname': r.get('nickname', ''), 'fingerprint': r.get('fingerprint', ''),
+               'flags': r.get('flags') or [], 'exit': 'Exit' in (r.get('flags') or []),
+               'contact': r.get('contact', ''), 'platform': r.get('platform', ''),
+               'country': r.get('country_name') or r.get('country', ''), 'as': r.get('as', ''),
+               'as_name': r.get('as_name', ''), 'first_seen': r.get('first_seen', ''),
+               'last_seen': r.get('last_seen', ''), 'running': r.get('running'),
+               'family_size': len(r.get('effective_family') or []), 'family': []}
+        if out['family_size'] and out['fingerprint']:
+            fam = _trace_fetch('https://onionoo.torproject.org/summary?family='
+                               + out['fingerprint'] + '&limit=60', timeout=8.0)
+            out['family'] = [{'nickname': x.get('n', ''), 'addresses': x.get('a', [])[:2]}
+                             for x in ((fam or {}).get('relays') or [])][:60]
+        return out
+    return None
+
+
+def _trace_footprint(asn: str) -> dict:
+    """The operator's BGP footprint from RIPEstat: how much address space it
+    announces and who it peers with."""
+    out: dict = {}
+    if not asn:
+        return out
+    pf = _trace_fetch(f'https://stat.ripe.net/data/announced-prefixes/data.json?resource={asn}', timeout=10.0)
+    pre = ((pf or {}).get('data') or {}).get('prefixes') or []
+    if pre:
+        out['prefix_count'] = len(pre)
+        out['prefix_sample'] = [p.get('prefix') for p in pre[:8]]
+    nb = _trace_fetch(f'https://stat.ripe.net/data/asn-neighbours/data.json?resource={asn}', timeout=10.0)
+    nd = (nb or {}).get('data') or {}
+    if nd.get('neighbour_counts'):
+        out['neighbours'] = nd['neighbour_counts']
+        out['neighbour_top'] = [f"AS{n.get('asn')}" for n in
+                                sorted(nd.get('neighbours', []), key=lambda n: -(n.get('power') or 0))[:6]]
+    return out
+
+
+def _trace_domain_profile(domain: str, exclude_ip: str = '') -> dict:
+    """What can be learned about an operator's domain: where it is hosted,
+    who registered it, and the contact points it publishes itself."""
+    prof: dict = {'domain': domain, 'ips': [], 'hosted_at': [], 'registrar': '', 'created': '',
+                  'nameservers': [], 'security_txt': {}}
+    addrs = sorted((a for a in _fwd_lookup_bounded(domain, 5.0)), key=lambda a: (':' in a, a))
+    prof['ips'] = addrs[:6]
+    for a in prof['ips'][:2]:
+        if _is_public_ip_cached(a):
+            c = cymru_asn_lookup(a) or {}
+            prof['hosted_at'].append({'ip': a, 'asn': c.get('asn', ''), 'name': c.get('name', '')})
+    rd = _trace_fetch(f'https://rdap.org/domain/{domain}', timeout=8.0)
+    if isinstance(rd, dict):
+        prof['nameservers'] = [n.get('ldhName', '') for n in (rd.get('nameservers') or [])][:6]
+        for ev in rd.get('events') or []:
+            if ev.get('eventAction') == 'registration':
+                prof['created'] = ev.get('eventDate', '')
+        for ent in rd.get('entities') or []:
+            if 'registrar' in (ent.get('roles') or []):
+                for v in (ent.get('vcardArray') or [None, []])[1]:
+                    if v[0] == 'fn':
+                        prof['registrar'] = v[3]
+    if _trace_public_host(domain):
+        for host in (domain, 'www.' + domain):
+            txt = _trace_fetch(f'https://{host}/.well-known/security.txt', timeout=6.0, raw=True,
+                               accept='text/plain')
+            if txt and 'contact' in txt.lower():
+                prof['security_txt'] = _parse_security_txt(txt)
+                prof['security_txt_url'] = f'https://{host}/.well-known/security.txt'
+                break
+    return prof
+
+
+def _trace_classify(d: dict) -> dict:
+    """Fuse registry, BGP, Tor, VPN-feed and provider-range evidence into a
+    plain classification of what kind of endpoint this is."""
+    reg, cy = d.get('registry') or {}, d.get('bgp') or {}
+    blob = ' '.join([str(reg.get('name', ''))] + [e.get('name', '') for e in reg.get('entities', [])]
+                    + [cy.get('name', ''), d.get('rdns', '')]).lower()
+    kinds, labels = [], []
+    tor = d.get('tor')
+    if tor:
+        kinds.append('tor-exit' if tor.get('exit') else 'tor-relay')
+        labels.append(f"Tor {'exit' if tor.get('exit') else 'relay'} '{tor.get('nickname')}'")
+    ex = d.get('exit_feed')
+    if ex:
+        kinds.append('vpn')
+        labels.append(f"{ex.get('provider')} {ex.get('kind', 'vpn')} server {ex.get('host', '')}".strip())
+    if any(m in blob for m in _VPN_ORG_MARKERS if m not in ('proxy', 'vpn', 'ovpn', 'pia ')):
+        kinds.append('vpn')
+        labels.append('registered to a VPN-provider network')
+    prov = d.get('provider_range')
+    if prov:
+        kinds.append('cdn' if prov['category'] == 'CDN' else 'cloud')
+        labels.append(prov['label'])
+    elif any(m in blob for m in ('cloudflare', 'akamai', 'fastly', 'cdn')):
+        kinds.append('cdn')
+    elif any(m in blob for m in _HOSTING_ORG_MARKERS):
+        kinds.append('hosting')
+        labels.append('hosting/datacentre network')
+    elif any(k in blob for k in ConnectionInventory._ORG_CATEGORY_HINTS[2][0]):
+        kinds.append('isp')
+        labels.append('consumer/ISP access network')
+    if (d.get('special') or {}).get('kind') == 'cgn':
+        kinds.append('cgn')
+    seen: list = []
+    for k in kinds:
+        if k not in seen:
+            seen.append(k)
+    return {'kinds': seen, 'labels': labels,
+            'intermediary': bool(set(seen) & {'tor-exit', 'tor-relay', 'vpn', 'cdn', 'cloud', 'hosting', 'cgn'}),
+            'access_network': 'isp' in seen}
+
+
+def _trace_operator_pivot(d: dict, probe: bool, depth: int) -> dict:
+    """Carry the trace to the operator: identify who runs the endpoint, then
+    run the same attribution against the operator's own infrastructure and
+    collect every contact point it publishes. The client behind a VPN/proxy/
+    Tor/CDN endpoint stays unidentifiable from public data; this stops at
+    the party that does hold that record."""
+    reg, cy, tor = d.get('registry') or {}, d.get('bgp') or {}, d.get('tor')
+    names: list = []
+
+    def add_name(n):
+        n = (n or '').strip()
+        if n and n not in ('?', 'Unknown') and n not in names:
+            names.append(n)
+    add_name(cy.get('name'))
+    for e in reg.get('entities', []):
+        if (e.get('name') and 'registrant' in e.get('roles', [])
+                and not re.search(r'-MNT$|^IRT-|Contact$|Administrators$|^ORG-', e['name'])):
+            add_name(e['name'])
+    add_name(reg.get('name'))
+    ex = d.get('exit_feed') or {}
+    add_name(ex.get('provider'))
+    if tor:
+        add_name(tor.get('as_name'))
+    doms: list = []
+    weak_doms: set = set()
+
+    def add_dom(x, weak=False):
+        x = _registrable_domain(x)
+        if x and '.' in x and x not in _GENERIC_MAIL_DOMAINS:
+            if x not in doms:
+                doms.append(x)
+                if weak:
+                    weak_doms.add(x)
+            elif not weak:
+                weak_doms.discard(x)
+    cert = d.get('tls') or {}
+    # Corroborated sources first: names the endpoint itself presents, and the
+    # registry/Tor contacts. A bare PTR name is only a candidate (weak): it is
+    # kept later only if it is hosted in the endpoint's own AS.
+    for h in list(cert.get('san', []))[:6] + [(cert.get('subject') or {}).get('commonName', '')]:
+        if h and '.' in h:
+            add_dom(h.lstrip('*.'))
+    for a in reg.get('abuse', []):
+        add_dom(a.rsplit('@', 1)[-1])
+    for c in reg.get('contacts', []):
+        for m in c.get('emails', []):
+            add_dom(m.rsplit('@', 1)[-1])
+    if tor:
+        for x in _extract_contact_domains(tor.get('contact', '')):
+            add_dom(x)
+    for h in (ex.get('host', ''), d.get('rdns', '')):
+        if h and '.' in h:
+            add_dom(h, weak=True)
+    out: dict = {'names': names[:6], 'domains': [], 'profiles': [], 'footprint': {},
+                 'tor_family': (tor or {}).get('family', []), 'operator_trace': None}
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=5) as ex_pool:
+        fp = ex_pool.submit(_trace_footprint, cy.get('asn', ''))
+        profs = [ex_pool.submit(_trace_domain_profile, x, d['ip']) for x in doms[:5]]
+        allp = [p.result() for p in profs]
+        out['footprint'] = fp.result()
+    target_asn = cy.get('asn', '')
+    out['profiles'] = [p for p in allp if p['domain'] not in weak_doms
+                       or any(h['asn'] == target_asn for h in p['hosted_at'])][:3]
+    out['dropped_uncorroborated'] = [p['domain'] for p in allp if p not in out['profiles']]
+    out['domains'] = [p['domain'] for p in out['profiles']]
+    own_ips = [d['ip']]
+    for prof in out['profiles']:
+        for a in prof['ips']:
+            if _is_public_ip_cached(a) and a not in own_ips:
+                out['operator_trace'] = trace_data(a, probe=probe, pivot=False, _depth=depth + 1,
+                                                   _path=False)
+                out['operator_trace_via'] = prof['domain']
+                break
+        if out['operator_trace']:
+            break
+    return out
+
+
+def _trace_evidence(d: dict) -> list:
+    """The facts a lawful request / abuse report to the operator must cite."""
+    reg = d.get('registry') or {}
+    lines = [f"Observed (UTC)  : {d['time_utc']}",
+             f"Remote endpoint : {d['ip']}" + (f" ({d['rdns']})" if d.get('rdns') else '')]
+    for lo in d.get('local', [])[:3]:
+        lines.append(f"Local socket    : {lo['proto']} {lo['local']} -> {d['ip']}:{lo['remote_port']} "
+                     f"[{lo['status']}] {lo['process'] or '?'} (PID {lo['pid']}) started {lo['started'] or '?'}")
+    contacts = list(reg.get('abuse', []))
+    for p in (d.get('operator') or {}).get('profiles', []):
+        contacts += [c for c in p.get('security_txt', {}).get('contact', []) if c not in contacts]
+    lines.append(f"Operator        : {', '.join((d.get('operator') or {}).get('names', [])[:3]) or reg.get('name', '?')}"
+                 f"  ASN {((d.get('bgp') or {}).get('asn')) or '?'}")
+    lines.append(f"Contact points  : {'; '.join(contacts[:6]) or '(none published)'}")
+    lines.append("Cite in request : destination IP + port, timestamps with UTC offset to the second,")
+    lines.append("                  and the SOURCE public IP + source port (CGNAT/NAT makes the port essential).")
+    return lines
+
+
+def trace_abuse_draft(d: dict) -> str:
+    """A ready-to-send abuse-report / records-request e-mail to the operator
+    that runs the endpoint. This is the one route that can actually reach the
+    party behind a VPN/proxy/Tor/CDN connection: the operator holds the
+    record, and this draft cites exactly what the operator needs to find it."""
+    reg = d.get('registry') or {}
+    op = d.get('operator') or {}
+    contacts = list(reg.get('abuse', []))
+    for p in op.get('profiles', []):
+        contacts += [c for c in p.get('security_txt', {}).get('contact', [])
+                     if c not in contacts and c.startswith('mailto:')]
+    contacts = [c.replace('mailto:', '') for c in contacts]
+    names = ', '.join(op.get('names', [])[:3]) or reg.get('name', 'the network operator')
+    asn = (d.get('bgp') or {}).get('asn', '')
+    cls = d.get('classification') or {}
+    L = [f"To: {', '.join(contacts) or '(operator publishes no contact address — see the trace report)'}",
+         f"Subject: Abuse report / records request regarding {d['ip']}"
+         + (f" ({d['rdns']})" if d.get('rdns') else ''),
+         "", "To the abuse / legal team,", "",
+         f"Our monitoring observed the following connection to infrastructure operated by {names}"
+         + (f" ({asn})" if asn else "") + ":",
+         ""]
+    for ln in d.get('evidence', []):
+        L.append("  " + ln)
+    if cls.get('labels'):
+        L += ["", f"Classification of the endpoint: {', '.join(cls.get('kinds', []))} — "
+              f"{'; '.join(cls['labels'][:3])}."]
+    L += ["",
+          "We request any records your systems hold associating the destination endpoint and the "
+          "timestamps above with a client, subscriber or account (source address and port, session "
+          "start/end times, account or subscription identifiers), to the extent your retention "
+          "policy and applicable law allow. This information is required for a security "
+          "investigation; we can provide statutory declarations or case documentation on request.",
+          "",
+          "Please treat the source address and port as essential — if the endpoint sits behind "
+          "carrier-grade NAT, the port is the only disambiguator.",
+          "",
+          "Regards,",
+          "(sender name / organisation / contact details)"]
+    return "\n".join(L)
+
+
+# Live wire-evidence hook — a running MedianBoxMonitor registers a callable
+# here so a trace sees the sniffer's passive harvest (leaked origins, alias
+# links). A standalone --trace has no capture; the unmask section then
+# reports the passive channels as unobservable rather than silently absent.
+_WIRE_EVIDENCE_FN = None
+
+
+def register_wire_evidence(fn) -> None:
+    global _WIRE_EVIDENCE_FN
+    _WIRE_EVIDENCE_FN = fn
+
+
+# Wire keys that disclose a DIFFERENT address — the relay, tunnel or stack
+# itself naming the origin it carries. (key -> (channel label, extractor))
+_UNMASK_LEAK_KEYS = (
+    ('proxyh_ips', 'PROXY-protocol header', lambda v: sorted(v)),
+    ('xff', 'X-Forwarded-For / Forwarded header', lambda v: [v]),
+    ('sipv_ips', 'SIP Via/Contact pre-NAT leak', lambda v: sorted(v)),
+    ('ftpp_ips', 'FTP PORT/EPRT embedded endpoint', lambda v: sorted(v)),
+    ('stun_mapped', 'STUN reflexive address',
+     lambda v: [str(v).rsplit(':', 1)[0]] if v else []),
+    ('v6dec', 'IPv6 transition-mechanism decode',
+     lambda v: [str(v).split(':', 1)[1]] if ':' in str(v) else []),
+    ('ecs', 'EDNS client subnet in DNS answer',
+     lambda v: [str(v).split('/')[0]] if v else []),
+)
+
+# Wire keys that LINK this endpoint to a second observed address — the two
+# share state that only one deployment, client or kernel can produce.
+_UNMASK_ALIAS_KEYS = (
+    ('sshkeylink', 'same SSH host key — the same daemon answers at'),
+    ('certlink', 'same TLS certificate — one deployment answers at'),
+    ('seslink', 'same TLS session state — client/server resuming at'),
+    ('hasshlink', 'identical SSH KEX set — one stack answers at'),
+    ('hlink', 'identical HTTP header order — one stack answers at'),
+    ('srvlink', 'same exotic Server banner — one deployment answers at'),
+    ('tsflink', 'same TCP timestamp clock — one kernel answers at'),
+    ('tslink', 'same TCP timestamp epoch — one kernel answers at'),
+    ('ipidlink', 'shared IP-ID counter — one kernel answers at'),
+    ('tflink', 'same TCP fingerprint — one stack answers at'),
+    ('flink', 'same flow fingerprint — one channel answers at'),
+    ('qrot', 'address-rotating resolver — one infrastructure at'),
+)
+
+
+def _unmask_attr(ips: list) -> dict:
+    """Cheap per-IP attribution for leaked/linked addresses: PTR + Cymru AS."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _one(a):
+        o = {'rdns': _rdns_bounded(a, 3.0)}
+        try:
+            cy = cymru_asn_lookup(a)
+            if cy:
+                o['asn'] = cy.get('asn', '')
+                o['as_name'] = cy.get('name', '')
+                o['cc'] = cy.get('cc', '')
+        except Exception:
+            pass
+        return a, o
+
+    out = {}
+    with ThreadPoolExecutor(max_workers=min(6, max(1, len(ips)))) as ex:
+        for a, o in ex.map(_one, ips):
+            out[a] = o
+    return out
+
+
+def _trace_unmask(ip: str, d: dict) -> dict:
+    """Check every channel by which the party BEHIND this endpoint can still
+    be named — the engineering answer to 'the relay hides the client'.
+
+    Three families are tried live:
+      disclosed — the wire itself named an origin (PROXY header, XFF,
+                  SIP/FTP embedded endpoints, STUN reflexive, tunnel-inner
+                  decapsulation, transition decode, EDNS client subnet);
+      linked    — this endpoint shares state with a second observed address
+                  that only one deployment/client/kernel can produce (host
+                  key, certificate, session id, header order, TCP clock,
+                  IP-ID counter, packet-gap shape);
+      held      — the operator's own records, reached via the lawful
+                  request drafted in the evidence packet.
+    """
+    out = {'capture': False, 'origins': [], 'aliases': [],
+           'tokens': [], 'channels': [], 'holder': ''}
+    w = {}
+    if _WIRE_EVIDENCE_FN is not None:
+        try:
+            w = _WIRE_EVIDENCE_FN(ip) or {}
+            out['capture'] = True
+        except Exception:
+            w = {}
+    seen: set = set()
+    chan: dict = {}
+    for key, label, extract in _UNMASK_LEAK_KEYS:
+        addrs = []
+        try:
+            addrs = [a for a in (extract(w.get(key)) or [])
+                     if a and a != ip and a not in seen]
+        except Exception:
+            addrs = []
+        for a in addrs:
+            seen.add(a)
+            out['origins'].append({'ip': a, 'via': label,
+                                   'public': _is_public_ip_cached(a)})
+        chan[label] = bool(addrs)
+    emb = (d.get('special') or {}).get('embedded')
+    if emb:
+        chan['transition-mechanism embedded IPv4'] = True
+        if emb not in seen:
+            seen.add(emb)
+            out['origins'].append(
+                {'ip': emb, 'via': 'address self-decodes — mechanism embeds IPv4',
+                 'public': _is_public_ip_cached(emb)})
+    if w.get('_was_inner'):
+        out['tokens'].append('this address was itself decapsulated from '
+                             'inside a tunnelled flow — it is an inner endpoint')
+    for key, phrase in _UNMASK_ALIAS_KEYS:
+        v = w.get(key)
+        if not v:
+            continue
+        if key == 'salink':
+            _kind, _, av = str(v).partition(':')
+            phrase = f'shared {_kind} address — one association at'
+        else:
+            av = str(v)
+        if not av or av == ip:
+            continue
+        out['aliases'].append({'ip': av, 'how': phrase})
+        if av not in seen:
+            seen.add(av)
+    fc = w.get('flowcorr')
+    if fc:
+        _pk, _, _rest = str(fc).partition(':')
+        _a, _, _dist = _rest.partition(':')
+        if _a and _a != ip and _a not in seen:
+            seen.add(_a)
+            out['aliases'].append(
+                {'ip': _a, 'how': f'packet-gap shape matches the :{_pk} flow '
+                 f'(d={_dist}) — one shaped source feeding both addresses'})
+    if w.get('eui64'):
+        out['tokens'].append(
+            f"MAC {w['eui64']} ({w.get('eui64vend') or '?'} hardware) embedded "
+            'in the IPv6 address — a device fingerprint that survives rotation')
+    for k, lab in (('zt_nodes', 'ZeroTier node id'), ('sshkey', 'SSH host key'),
+                   ('hassh', 'HASSH'), ('cert_cn', 'certificate CN'),
+                   ('passban', 'greeting banner'), ('srvban', 'Server banner'),
+                   ('sshver', 'SSH version'), ('srvvia', 'Via chain')):
+        v = w.get(k)
+        if not v:
+            continue
+        sv = sorted(v) if isinstance(v, set) else [v]
+        out['tokens'].append(f"{lab}: {', '.join(map(str, list(sv)[:3]))}")
+    pub = [a for a in seen if _is_public_ip_cached(a)][:8]
+    attr = _unmask_attr(pub) if pub else {}
+    for rec in out['origins'] + out['aliases']:
+        rec.update(attr.get(rec['ip']) or {})
+    for label, hit in chan.items():
+        out['channels'].append({
+            'name': label,
+            'result': 'REVEALED' if hit else
+                      ('no leak observed' if out['capture']
+                       else 'not observable — needs live capture')})
+    out['channels'].append({
+        'name': 'shared-state alias links',
+        'result': f"{len(out['aliases'])} linked address(es)"
+                  if out['aliases'] else
+                  ('none observed' if out['capture']
+                   else 'not observable — needs live capture')})
+    og = d.get('origin') or {}
+    for c in og.get('candidates', []):
+        if c['ip'] not in seen:
+            seen.add(c['ip'])
+            out['origins'].append({
+                'ip': c['ip'], 'public': True,
+                'via': f"CDN origin [{c['tier']}] — {'; '.join(c['evidence'][:2])}"})
+        if c.get('tls_match') or c.get('http_match'):
+            out['tokens'].append(f"origin {c['ip']}: {c['tls_match'] or c['http_match']}")
+    out['channels'].append({
+        'name': 'CDN origin discovery',
+        'result': (f"{len(og.get('candidates', []))} candidate(s), "
+                   f"{len([c for c in og.get('candidates', []) if c['tier'] in ('confirmed', 'verified')])} verified"
+                   if og.get('candidates') else
+                   ('none found in public records' if og.get('domains') else 'not applicable — endpoint is not a CDN edge'))})
+    vg = (d.get('disclose') or {}).get('vpn_gate') or {}
+    ike = vg.get('ike1') or vg.get('ike2')
+    if ike or vg.get('openvpn') or vg.get('stun'):
+        named = ', '.join(x for x in ((ike or {}).get('id'), 'OpenVPN' if vg.get('openvpn') else '',
+                          (vg.get('stun') or {}).get('software')) if x)
+        if not named:
+            named = (f"IKE{'v2' if vg.get('ike2') else 'v1'} responder on :{ike['port']}"
+                     if ike else 'tunnel service answered')
+        out['channels'].append({'name': 'VPN gateway self-identification', 'result': f'REVEALED — {named}'})
+        if (ike or {}).get('id') and (ike['id'] not in seen):
+            seen.add(ike['id'])
+            out['tokens'].append(f"IKE responder declares itself '{ike['id']}'")
+    elif (d.get('disclose') or {}).get('vpn_gate') is not None:
+        out['channels'].append({'name': 'VPN gateway self-identification',
+                                'result': 'no IKE/OpenVPN/TURN reply'})
+    idb = (d.get('disclose') or {}).get('internetdb') or {}
+    if idb:
+        bits = []
+        if idb.get('hostnames'):
+            bits.append(str(len(idb['hostnames'])) + ' hostname(s)')
+        if idb.get('cpes'):
+            bits.append(str(len(idb['cpes'])) + ' CPE(s)')
+        if idb.get('tags'):
+            bits.append('tags: ' + ', '.join(idb['tags'][:4]))
+        out['channels'].append({'name': 'internet census (internetdb)',
+                                'result': 'REVEALED — ' + '; '.join(bits)})
+        for h in (idb.get('hostnames') or [])[:5]:
+            if h not in seen:
+                seen.add(h)
+                out['tokens'].append(f'census hostname: {h}')
+        for c in (idb.get('cpes') or [])[:4]:
+            out['tokens'].append(f'census CPE: {c}')
+    elif 'internetdb' in (d.get('disclose') or {}):
+        out['channels'].append({'name': 'internet census (internetdb)',
+                                'result': 'no census record'})
+    nb = (d.get('disclose') or {}).get('neighbors') or {}
+    if nb.get('operator_names'):
+        out['channels'].append({'name': 'prefix-neighbour attribution',
+                                'result': 'REVEALED — block names: ' +
+                                          ', '.join(nb['operator_names'][:4])})
+        for nm in nb['operator_names'][:4]:
+            out['tokens'].append(f'neighbour-names block: {nm}')
+    elif 'neighbors' in (d.get('disclose') or {}):
+        out['channels'].append({'name': 'prefix-neighbour attribution',
+                                'result': 'no named neighbours in /24'})
+    rel = ((d.get('canary') or {}).get('relay') or {})
+    if rel:
+        out['channels'].append({
+            'name': 'open-proxy relay egress test',
+            'result': (f"REVEALED — relayed via :{', :'.join(str(r['port']) for r in rel['relayed'])}; "
+                       f"egress IP arrives at canary" if rel.get('relayed') else
+                       'no open relay on proxy ports')})
+    sid = (d.get('disclose') or {}).get('selfid') or {}
+    sid_names = _selfid_names(sid)
+    for tok in sid_names:
+        out['tokens'].append(tok)
+    if sid or sid_names:
+        out['channels'].append({
+            'name': 'endpoint self-naming battery',
+            'result': (f'REVEALED — {len(sid_names)} self-disclosed identifier(s)'
+                       if sid_names else 'no self-naming service answered')})
+    # ==================== TIER-1/2/3 subscriber-location channels ====================
+    dm = d.get('demask') or {}
+    if dm.get('armed'):
+        pub_ice = [l['addr'] for l in dm.get('ice_leaks', []) if l.get('public')]
+        if pub_ice:
+            out['origins'].append({'ip': pub_ice[0], 'via': 'webrtc/ice leak',
+                                   'conf': 'high', 'leak': True})
+            out['tokens'].append('client ICE candidate leaked real egress: ' + pub_ice[0])
+        for extra in pub_ice[1:]:
+            out['aliases'].append({'ip': extra, 'how': 'additional ICE candidate'})
+        out['channels'].append({
+            'name': 'induced leak (webrtc/canary/dns)',
+            'result': (f'REVEALED — pre-tunnel egress {pub_ice[0]} via client ICE'
+                       if pub_ice else
+                       f"armed — demask page {dm.get('url', '')} awaits the client's browser"
+                       if not dm.get('hits') else
+                       f"{len(dm['hits'])} callback hit(s); no ICE leak yet")})
+        if dm.get('dns_leaks'):
+            rs = ', '.join(h['resolver'] + (f" ecs={h['ecs']}" if h.get('ecs') else '')
+                           for h in dm['dns_leaks'][:4])
+            out['channels'].append({'name': 'DNS resolver egress leak',
+                                    'result': f'REVEALED — resolver(s) {rs} queried our zone'})
+            for h in dm['dns_leaks'][:4]:
+                out['tokens'].append(f"resolver egress: {h['resolver']}"
+                                     + (f" (client subnet {h['ecs']})" if h.get('ecs') else ''))
+    else:
+        out['channels'].append({
+            'name': 'induced leak (webrtc/canary/dns)',
+            'result': 'not armed — run with --canary PORT to mint demask URLs'})
+    fm = dm.get('flow_matches') or []
+    # local-wire watermark hits flow in through the wire evidence dict
+    wm_hit = w.get('wm_match')
+    if wm_hit:
+        _wp, _, _wr = wm_hit.partition(':')
+        _wm2, _, _ws = _wr.partition(':')
+        out['tokens'].append(f'watermark {_wm2} confirmed on the :{_wp} flow '
+                             f'(corr {_ws})')
+    _wm_result = None
+    if wm_hit:
+        _wm_result = (f'REVEALED — wire flow :{_wp} matches injected '
+                      f'watermark {_wm2} (score {_ws}) — shaped flow observed')
+    elif fm:
+        _wm_result = (f'REVEALED — vantage observation matched injected watermark '
+                      f'(score {fm[0]["score"]})')
+    elif dm.get('armed'):
+        _wm_result = 'injected on demask page fetch; vantage ingest at /f/<tok>'
+    else:
+        _wm_result = 'not armed — needs --canary PORT and a second observation point'
+    out['channels'].append({
+        'name': 'active flow watermarking',
+        'result': _wm_result})
+    fl = dm.get('fp_links') or []
+    out['channels'].append({
+        'name': 'session-fingerprint linkage',
+        'result': (f"REVEALED — same client fingerprint seen at {', '.join(fl[0]['ips'][:4])}"
+                   if fl else
+                   'no cross-egress fingerprint link yet' if dm.get('armed') else
+                   'not armed — needs --canary PORT to set session tokens')})
+    out['channels'].append({
+        'name': 'end-to-end flow correlation',
+        'result': ('REVEALED — entry-side and exit-side flow match' if fm else
+                   'needs a lawful second vantage (ISP NetFlow / cooperating peer) posting to /f/')})
+    # Tier 3 — Tor-side exposure, searched on every trace: a non-Tor
+    # endpoint can still be reached by a client entering through a relay
+    # we run, and the guard census is the population model regardless.
+    gc = d.get('guard_census') or {}
+    if gc.get('guards'):
+        out['channels'].append({
+            'name': 'tor guard population model',
+            'result': f"{gc['guards']} guards; top guard holds ~"
+                      f"{(gc['top'][0]['est_population_share_pct'] if gc['top'] else 0)}% "
+                      'of the client population'})
+    else:
+        out['channels'].append({'name': 'tor guard population model',
+                                'result': 'no consensus data (onionoo unreachable)'})
+    sc = d.get('sybil') or {}
+    out['channels'].append({
+        'name': 'owned-relay correlation position',
+        'result': (f"{sc['configured']} own relay(s) configured; entry cover: "
+                   f"{sc.get('covers_entry')}, exit cover: {sc.get('covers_exit')}"
+                   if sc.get('configured') else
+                   'none — set our_tor_relays[] to claim a correlation position')})
+    tro = d.get('tor_relay_observe') or {}
+    if tro.get('clients'):
+        out['channels'].append({
+            'name': 'local guard observation',
+            'result': f"REVEALED — {len(tro['clients'])} client(s) entering through our relay"})
+        for c in tro['clients'][:8]:
+            out['origins'].append({'ip': c['ip'], 'via': 'local tor guard inbound',
+                                   'conf': 'high', 'leak': True})
+    elif tro.get('running'):
+        out['channels'].append({'name': 'local guard observation',
+                                'result': 'relay running; no client circuits observed'})
+    else:
+        out['channels'].append({'name': 'local guard observation',
+                                'result': 'no local tor relay — position unclaimed'})
+    # Tier 4 — documented boundary, not implemented
+    for nm, why in (
+        ('exit-server compromise', 'intrusion into third-party infrastructure — out of scope; '
+                                   'the lawful substitute is the operator-records request'),
+        ('client compromise/agent', 'deploying code to the subscriber device — out of scope; '
+                                    'the lawful substitute is the induced-leak canary'),
+        ('protocol subversion', 'crafted-packet attacks on IKE/Tor — version-specific, mostly '
+                                'patched, and unauthorized; boundary documented only')):
+        out['channels'].append({'name': nm, 'result': 'BLOCKED — ' + why})
+    out['channels'].append({
+        'name': 'operator-held records',
+        'result': 'open — lawful request drafted in the evidence packet'})
+    op = (d.get('operator') or {}).get('names') or \
+        [((d.get('registry') or {}).get('name') or '')]
+    out['holder'] = ', '.join(x for x in op[:2] if x) or 'the registered operator'
+    return out
+
+
+# ===================== VPN GATEWAY SELF-IDENTIFICATION =====================
+# Active probes that make the endpoint name its own tunnel stack. An IKE
+# responder answers SA_INIT with VENDOR-IDs and (v1 aggressive mode) an ID
+# payload carrying its declared FQDN/address in cleartext — 'vpn.acme-
+# corp.com' is the operator's own name for the mask. OpenVPN answers a
+# control-channel HARD_RESET with its own reset. A TURN/STUN service states
+# its software build. None of this is guessed: every label is something the
+# endpoint itself emitted.
+
+
+def _udp_exchange(ip: str, port: int, pkt: bytes, timeout: float = 2.5,
+                  read_n: int = 2048) -> bytes:
+    """One bounded UDP request/response against the endpoint."""
+    try:
+        fam = socket.AF_INET6 if ':' in ip else socket.AF_INET
+        with socket.socket(fam, socket.SOCK_DGRAM) as s:
+            s.settimeout(timeout)
+            s.sendto(pkt, (ip, port))
+            return s.recvfrom(read_n)
+    except (socket.timeout, OSError):
+        return b''
+
+
+def _ike2_init_packet() -> bytes:
+    """Minimal IKEv2 IKE_SA_INIT. Even a NO_PROPOSAL_CHOSEN reply proves the
+    listener is an IPsec responder, and vendor-ID / notify payloads name
+    the stack family."""
+    def tf(nxt, ttype, tid, keylen=None):
+        attrs = b'' if keylen is None else struct.pack('!HH', 0x8000 | 14, keylen)
+        return struct.pack('!BBHBBH', nxt, 0, 8 + len(attrs), ttype, 0, tid) + attrs
+    # AES-CBC-256 / PRF-SHA2-256 / AUTH-SHA2-256-128 / DH group 14
+    xforms = tf(3, 1, 12, 256) + tf(3, 2, 5) + tf(3, 3, 12) + tf(0, 4, 14)
+    prop = struct.pack('!BBHBBBB', 0, 0, 8 + len(xforms), 1, 1, 0, 4) + xforms
+    sa = struct.pack('!BBH', 10, 0, 4 + len(prop)) + prop
+    ke = struct.pack('!BBHHH', 5, 0, 264, 14, 0) + os.urandom(256)
+    ni = struct.pack('!BBH', 0, 0, 40) + os.urandom(32)
+    body = sa + ke + ni
+    return (struct.pack('!8s8sBBBBII', os.urandom(8), b'\x00' * 8, 33,
+                        0x20, 34, 0x08, 0, 28 + len(body)) + body)
+
+
+_IKE2_NOTIFY = {1: 'UNSUPPORTED_CRITICAL_PAYLOAD', 4: 'INVALID_IKE_SPI',
+                5: 'INVALID_MAJOR_VERSION', 7: 'INVALID_SYNTAX',
+                14: 'NO_PROPOSAL_CHOSEN', 24: 'AUTHENTICATION_FAILED'}
+
+_IKE_VID_NAMES = {
+    'afcad71368a1f1c96b8696fc77570100': 'Dead Peer Detection (RFC 3706)',
+    '4a131c81070358455c5728f20e95452f': 'NAT-T (RFC 3947)',
+    '90cb80913ebb696e086381b5ec427b1f': 'draft-ietf-ipsec-nat-t-ike-02',
+    '12f5f28c457168a9702d9fe274cc0100': 'Cisco Unity / IOS XAUTH',
+    '1f07f70eaa6514d3b0fa96542a500100': 'Cisco Fragmentation',
+}
+
+
+def _vid_name(vid: bytes) -> str:
+    """Render an IKE VENDOR-ID: printable strings as-is (strongSwan sends
+    'strongSwan 5.x'), known hashes by name, others as a hex fingerprint."""
+    if not vid:
+        return ''
+    h = vid.hex()
+    if h in _IKE_VID_NAMES:
+        return _IKE_VID_NAMES[h]
+    try:
+        t = vid.decode('ascii')
+        if t.strip() and sum(32 <= c < 127 for c in vid) / len(vid) > 0.8:
+            return t.strip('\x00 ')[:80]
+    except UnicodeDecodeError:
+        pass
+    return f'vid:{h[:24]}'
+
+
+def _ike_id_val(idt: int, val: bytes) -> str:
+    if idt == 1 and len(val) >= 4:
+        return '.'.join(str(b) for b in val[:4])
+    if idt == 5 and len(val) >= 16:
+        return str(ipaddress.IPv6Address(val[:16]))
+    if idt in (2, 3, 9, 10, 11):
+        s = val.decode('ascii', 'replace').strip('\x00')
+        if s:
+            return s[:80]
+    return ''
+
+
+def _ike1_reply_info(resp: bytes) -> dict:
+    """Walk an IKEv1 reply's payload chain: responder ID (type 5) carries
+    the gateway's declared address/FQDN/USER_FQDN; vendor IDs (type 13)
+    fingerprint the stack."""
+    out = {'id': '', 'vids': []}
+    try:
+        if len(resp) < 28:
+            return out
+        nxt, off = resp[16], 28
+        for _ in range(32):
+            if off + 4 > len(resp) or not nxt:
+                break
+            ptype = nxt
+            nxt, _c, plen = struct.unpack('!BBH', resp[off:off + 4])
+            if plen < 4 or off + plen > len(resp):
+                break
+            body = resp[off + 4:off + plen]
+            if ptype == 5 and len(body) >= 5 and not out['id']:
+                out['id'] = _ike_id_val(body[0], body[4:])
+            elif ptype == 13 and body:
+                nm = _vid_name(body)
+                if nm and nm not in out['vids']:
+                    out['vids'].append(nm)
+            off += plen
+    except Exception:
+        pass
+    return out
+
+
+def _ike2_reply_info(resp: bytes) -> dict:
+    """Walk an IKEv2 reply's payload chain: VENDOR-ID (43), Notify (41),
+    responder ID (35/36)."""
+    out = {'id': '', 'vids': [], 'notify': []}
+    try:
+        if len(resp) < 28:
+            return out
+        nxt, off = resp[16], 28
+        for _ in range(32):
+            if off + 4 > len(resp) or not nxt:
+                break
+            ptype = nxt
+            nxt, _c, plen = struct.unpack('!BBH', resp[off:off + 4])
+            if plen < 4 or off + plen > len(resp):
+                break
+            body = resp[off + 4:off + plen]
+            if ptype == 43 and body:
+                nm = _vid_name(body)
+                if nm and nm not in out['vids']:
+                    out['vids'].append(nm)
+            elif ptype == 41 and len(body) >= 4:
+                ntype = struct.unpack('!H', body[2:4])[0]
+                out['notify'].append(_IKE2_NOTIFY.get(ntype, f'type {ntype}'))
+            elif ptype in (35, 36) and len(body) >= 4 and not out['id']:
+                out['id'] = _ike_id_val(body[0], body[4:])
+            off += plen
+    except Exception:
+        pass
+    return out
+
+
+def _internetdb_probe(ip: str, timeout: float = 10.0) -> dict:
+    """internetdb.shodan.io — free, keyless census record for a public IP.
+    Returns observed hostnames (passive-DNS grade), open ports, CPE
+    fingerprints, vuln ids and Shodan tags (cdn/vpn/cloud/self-signed...).
+    A bare IP with no PTR and no registry name still carries a whole
+    observed-service dossier here — every hostname found feeds tenant
+    discovery and origin hunting."""
+    out = {}
+    try:
+        req = urllib.request.Request(
+            f'https://internetdb.shodan.io/{ip}',
+            headers={'User-Agent': 'medianbox-monitor/2'})
+        data = json.loads(urllib.request.urlopen(req, timeout=timeout).read())
+        if isinstance(data, dict):
+            out = {k: data.get(k) for k in
+                   ('hostnames', 'ports', 'cpes', 'tags', 'vulns')
+                   if data.get(k)}
+    except Exception:
+        pass
+    return out
+
+
+def _neighbor_probe(ip: str, span: int = 4, timeout: float = 4.0) -> dict:
+    """Prefix-neighbour attribution: rDNS the IPs immediately adjacent to
+    the target inside its /24. Operators frequently name only some of
+    their block (mail.example.com, ns1.example.com, edge-01.example.com) —
+    a named neighbour attributes the entire block's operator even when the
+    target address itself is anonymous."""
+    out = {'neighbors': [], 'operator_names': []}
+    try:
+        base = ipaddress.ip_address(ip)
+        if base.version != 4:
+            return out
+        seen = set()
+        names = []
+        for delta in range(-span, span + 1):
+            if delta == 0:
+                continue
+            try:
+                nip = str(base + delta)
+            except Exception:
+                continue
+            try:
+                host, _, _ = socket.gethostbyaddr(nip)
+            except Exception:
+                continue
+            host = host.rstrip('.').lower()
+            if host in seen:
+                continue
+            seen.add(host)
+            out['neighbors'].append({'ip': nip, 'rdns': host})
+            # strip the host label to get the registrable suffix candidates
+            parts = host.split('.')
+            if len(parts) >= 2:
+                names.append('.'.join(parts[-2:]))
+        out['operator_names'] = sorted(set(names))[:6]
+    except Exception:
+        pass
+    return out
+
+def _vpn_gate_probe(ip: str, timeout: float = 2.5) -> dict:
+    """Ask the endpoint to name its own tunnel stack. IKE on 500/4500 gets
+    an IPsec responder ID + vendor list; OpenVPN's UDP control channel
+    echoes a HARD_RESET; a TURN service discloses its build. Bounded:
+    <=5 UDP datagrams, ~8s worst case."""
+    out: dict = {}
+    for port in (500, 4500):
+        resp = _udp_exchange(ip, port, _ike2_init_packet(), timeout)
+        if resp:
+            info = _ike2_reply_info(resp)
+            info['port'] = port
+            out['ike2'] = info
+            break
+        resp = _udp_exchange(ip, port, _ike1_init_packet(), timeout)
+        if resp:
+            info = _ike1_reply_info(resp)
+            info['port'] = port
+            out['ike1'] = info
+            break
+    resp = _udp_exchange(ip, 1194, bytes([8 << 3]) + os.urandom(8), timeout)
+    if resp and len(resp) >= 9 and (resp[0] >> 3) in _OVPN_OPS:
+        out['openvpn'] = {'opcode': _OVPN_OPS.get(resp[0] >> 3, str(resp[0] >> 3)),
+                          'reply_len': len(resp)}
+    resp = _udp_exchange(ip, 3478, _stun_bind_packet(), timeout)
+    if resp:
+        sw = _parse_stun_software(resp)
+        out['stun'] = {'software': sw or 'STUN/TURN service'}
+    return out
+
+
+# ===================== GENERIC DNS RECORD QUERY =====================
+
+def _dns_records(name: str, qtype: int, servers: Optional[list] = None,
+                 timeout: float = 2.5) -> list:
+    """One bounded UDP DNS query. Returns decoded answer rdata:
+    A/AAAA -> address str, MX -> (pref, host), NS/CNAME/PTR -> host,
+    TXT -> joined string, SRV -> (prio, weight, port, target)."""
+    try:
+        labels = [l for l in name.rstrip('.').split('.') if l]
+        qid = os.urandom(2)
+        pkt = (qid + b'\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00'
+               + b''.join(bytes([len(l)]) + l.encode('ascii') for l in labels)
+               + b'\x00' + struct.pack('!HH', qtype, 1))
+    except (UnicodeError, ValueError):
+        return []
+    for srv in (servers or _system_dns_servers()):
+        try:
+            fam = socket.AF_INET6 if ':' in srv else socket.AF_INET
+            with socket.socket(fam, socket.SOCK_DGRAM) as s:
+                s.settimeout(timeout)
+                s.sendto(pkt, (srv, _DNS_PORT))
+                while True:
+                    data = s.recvfrom(4096)[0]
+                    if data[:2] == qid:
+                        break
+            if len(data) < 12:
+                continue
+            rcode = data[3] & 0x0F
+            if rcode == 3:
+                return []
+            if rcode:
+                continue
+            qd, an = struct.unpack('!HH', data[4:8])
+            off = 12
+            for _ in range(min(qd, 16)):
+                _, e = _dns_read_name(data, off)
+                if not e:
+                    return []
+                off = e + 4
+            out = []
+            for _ in range(min(an, 64)):
+                _, e = _dns_read_name(data, off)
+                if not e or e + 10 > len(data):
+                    break
+                rtype, _rc, _ttl, rdlen = struct.unpack('!HHIH', data[e:e + 10])
+                roff = e + 10
+                rd = data[roff:roff + rdlen]
+                off = roff + rdlen
+                if rtype == 1 and rdlen == 4:
+                    out.append('.'.join(str(b) for b in rd))
+                elif rtype == 28 and rdlen == 16:
+                    out.append(str(ipaddress.IPv6Address(rd)))
+                elif rtype == 15 and rdlen >= 3:
+                    pref = struct.unpack('!H', rd[:2])[0]
+                    h, _ = _dns_read_name(data, roff + 2)
+                    if h:
+                        out.append((pref, h.rstrip('.')))
+                elif rtype in (2, 5, 12):
+                    h, _ = _dns_read_name(data, roff)
+                    if h:
+                        out.append(h.rstrip('.'))
+                elif rtype == 33 and rdlen >= 7:
+                    pr, wt, pt = struct.unpack('!HHH', rd[:6])
+                    h, _ = _dns_read_name(data, roff + 6)
+                    if h:
+                        out.append((pr, wt, pt, h.rstrip('.')))
+                elif rtype == 16:
+                    i, parts = 0, []
+                    while i < len(rd):
+                        ln = rd[i]
+                        parts.append(rd[i + 1:i + 1 + ln].decode('utf-8', 'replace'))
+                        i += 1 + ln
+                    out.append(''.join(parts))
+            return out
+        except (OSError, struct.error, IndexError):
+            continue
+    return []
+
+
+def _mx_hosts(domain: str) -> list:
+    """MX targets for a domain — mail frequently runs on the origin even
+    when the web site is CDN-fronted."""
+    try:
+        mxs = [r for r in _dns_records(domain, 15) if isinstance(r, tuple)]
+        return [h for _, h in sorted(mxs, key=lambda r: r[0])]
+    except Exception:
+        return []
+
+
+def _spf_addrs(domain: str, depth: int = 0) -> list:
+    """ip4:/ip6: mechanisms in the SPF record — operators publish the
+    origin's real netblock so mail can leave it."""
+    out = []
+    try:
+        for txt in _dns_records(domain, 16):
+            if not isinstance(txt, str) or 'v=spf1' not in txt[:12].lower():
+                continue
+            for m in re.finditer(r'\bip[46]:([0-9a-fA-F:./]+)', txt):
+                out.append(m.group(1))
+            if depth == 0:
+                for inc in re.findall(r'\binclude:([A-Za-z0-9._-]+)', txt):
+                    out += _spf_addrs(inc, depth + 1)
+    except Exception:
+        pass
+    return out[:12]
+
+
+# ===================== CDN ORIGIN DISCOVERY =====================
+# When the observed endpoint is a CDN/cloud edge, the address that serves
+# the tenant's content — the ORIGIN — is a second identity the mask hides.
+# Public record names it in several places: subdomain tables (origin-flavor
+# names like direct./dev./mail. routinely bypass the CDN), MX and SPF
+# records (mail leaves from the origin netblock), certificate transparency,
+# and passive-DNS history. Each candidate is then verified against the
+# endpoint's own presentation: a candidate that serves the site's own
+# certificate for the domain (same fingerprint or SAN coverage) or
+# identical content is the origin, not a lookalike.
+
+_ORIGIN_SUB_HINTS = frozenset(
+    {'direct', 'origin', 'dev', 'staging', 'test', 'mail', 'mx', 'mx1', 'mx2',
+     'ftp', 'cpanel', 'webmail', 'vpn', 'remote', 'ns1', 'ns2', 'gw', 'gateway',
+     'beta', 'legacy', 'old', 'backup', 'bak', 'smtp', 'imap', 'pop', 'pop3',
+     'exchange', 'ssh', 'nocdn', 'bare', 'direct-api', 'api-direct',
+     'cdn-bypass', 'staging-api', 'admin', 'panel', 'whm', 'zabbix', 'gitlab',
+     'jenkins', 'jira', 'wiki', 'db', 'mysql', 'pgsql', 'internal', 'intranet'})
+
+
+def _hostsearch_records(domain: str) -> list:
+    """hackertarget hostsearch — the subdomain->IP table public DNS
+    publishes; non-CDN IPs in it are origin candidates."""
+    out = []
+    txt = _trace_fetch(f'https://api.hackertarget.com/hostsearch/?q={domain}',
+                       7.0, 'text/plain', raw=True)
+    if isinstance(txt, str):
+        for line in txt.splitlines():
+            parts = line.strip().split(',')
+            if len(parts) == 2 and '.' in parts[0]:
+                try:
+                    ipaddress.ip_address(parts[1])
+                    out.append({'host': parts[0].lower(), 'ip': parts[1]})
+                except ValueError:
+                    continue
+    return out[:60]
+
+
+def _rapiddns_subs(domain: str) -> list:
+    """rapiddns.io subdomain table — rows carry the resolved address, so a
+    subdomain sitting outside the CDN's range is a direct origin lead."""
+    out = []
+    html = _trace_fetch(f'https://rapiddns.io/subdomain/{domain}?full=1',
+                        8.0, 'text/html', raw=True)
+    if isinstance(html, str):
+        dl = domain.lower()
+        for m in re.finditer(
+                r'<td>([a-z0-9][a-z0-9.-]*\.' + re.escape(dl) +
+                r')</td>\s*<td>((?:\d{1,3}\.){3}\d{1,3}|[0-9a-fA-F:]{3,45})</td>\s*<td>([A-Z]+)</td>',
+                html.lower()):
+            host, ip, rtype = m.group(1), m.group(2), m.group(3)
+            if rtype in ('a', 'aaaa'):
+                try:
+                    ipaddress.ip_address(ip)
+                    out.append({'host': host, 'ip': ip})
+                except ValueError:
+                    continue
+        if not out:  # looser fallback: any host,ip pair in the table
+            for m in re.finditer(
+                    r'<td>([a-z0-9][a-z0-9.-]*\.' + re.escape(dl) +
+                    r')</td>\s*<td>((?:\d{1,3}\.){3}\d{1,3})</td>', html.lower()):
+                try:
+                    ipaddress.ip_address(m.group(2))
+                    out.append({'host': m.group(1), 'ip': m.group(2)})
+                except ValueError:
+                    continue
+    return out[:60]
+
+
+def _otx_domain_records(domain: str) -> list:
+    """AlienVault OTX passive DNS for a domain — historical resolutions,
+    including pre-CDN addresses retired when the site moved behind the
+    edge."""
+    out = []
+    data = _trace_fetch(
+        f'https://otx.alienvault.com/api/v1/indicators/domain/{domain}/passive_dns',
+        8.0)
+    if isinstance(data, dict):
+        for row in data.get('passive_dns') or []:
+            h = (row or {}).get('hostname') or domain
+            a = (row or {}).get('address') or ''
+            if a:
+                try:
+                    ipaddress.ip_address(a)
+                    out.append({'host': str(h).lower(), 'ip': a})
+                except ValueError:
+                    continue
+    return out[:60]
+
+
+def _sni_cert(ip: str, domain: str, port: int = 443, timeout: float = 4.0) -> dict:
+    """TLS handshake presenting SNI=<domain>. Returns the cert's CN, SANs
+    and DER fingerprint — proves whether a candidate IP serves the domain's
+    certificate (the origin's own identity)."""
+    out = {'ok': False, 'cn': '', 'san': [], 'sha256': ''}
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        with socket.create_connection((ip, port), timeout=timeout) as raw:
+            with ctx.wrap_socket(raw, server_hostname=domain or None) as s:
+                der = s.getpeercert(binary_form=True)
+        if not der:
+            return out
+        out['sha256'] = hashlib.sha256(der).hexdigest()[:16]
+        cert = {}
+        import tempfile
+        pem = ssl.DER_cert_to_PEM_cert(der)
+        with tempfile.NamedTemporaryFile('w', suffix='.pem', delete=False) as tf:
+            tf.write(pem)
+            tmp = tf.name
+        try:
+            cert = ssl._ssl._test_decode_cert(tmp)  # type: ignore
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+        flat = lambda rdns: {k: v for r in rdns for k, v in r}
+        subj = flat(cert.get('subject', ()))
+        out.update(ok=True, cn=subj.get('commonName', ''),
+                   san=[v for k, v in cert.get('subjectAltName', ()) if k == 'DNS'][:20])
+    except Exception as exc:
+        out['error'] = str(exc)[:120]
+    return out
+
+
+def _http_meta(ip: str, port: int, host: str, timeout: float = 4.5) -> dict:
+    """GET / with a specific Host header — status line, <title> and a body
+    digest for comparing an origin candidate against the CDN-fronted site."""
+    out: dict = {}
+    req = (f'GET / HTTP/1.1\r\nHost: {host or ip}\r\n'
+           'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\n'
+           'Accept: text/html,*/*\r\nConnection: close\r\n\r\n').encode()
+    r = _tcp_probe(ip, port, timeout, send=req, read_s=3.5, read_n=49152)
+    b = r['banner']
+    if not b.startswith(b'HTTP/'):
+        if r['banner']:
+            out['banner'] = _banner_guess(b)
+        return out
+    head, _, body = b.partition(b'\r\n\r\n')
+    out['status'] = head.split(b'\r\n', 1)[0].decode('latin1', 'replace')[:80]
+    t = re.search(rb'<title[^>]*>(.*?)</title>', body, re.I | re.S)
+    if t:
+        out['title'] = re.sub(r'\s+', ' ', t.group(1).decode('utf-8', 'replace')).strip()[:140]
+    out['hash'] = hashlib.sha1(body[:8192]).hexdigest()[:12]
+    return out
+
+
+def _is_cdn_edge_ip(ip: str) -> bool:
+    try:
+        pr = PROVIDER_RANGES.lookup(ip)
+        return bool(pr and pr.get('category') == 'CDN')
+    except Exception:
+        return False
+
+
+def _origin_candidates(d: dict) -> dict:
+    """Collect the domain set for this endpoint, then every off-CDN address
+    public DNS/records associate with those domains. Returns
+    {'domains': [...], 'candidates': {ip: {'evidence': set, 'names': set}}}."""
+    edge = d['ip']
+    doms: list = []
+    if d.get('target') and d['target'] != edge:
+        rd = _registrable_domain(d['target'])
+        if rd:
+            doms.append(rd)
+    cert = d.get('tls') or {}
+    for h in list(cert.get('san', []))[:8] + [(cert.get('subject') or {}).get('commonName', '')]:
+        h = (h or '').lstrip('*.').strip()
+        rd = _registrable_domain(h)
+        if rd and rd not in doms and rd not in _GENERIC_MAIL_DOMAINS:
+            doms.append(rd)
+    dis = d.get('disclose') or {}
+    for h in list((dis.get('vhosts') or {}).get('domains', []))[:10] + \
+            list(dis.get('ct_names', []))[:10] + \
+            list((dis.get('internetdb') or {}).get('hostnames', []))[:10]:
+        rd = _registrable_domain(h)
+        if rd and rd not in doms and rd not in _GENERIC_MAIL_DOMAINS:
+            doms.append(rd)
+    cand: dict = {}
+    searched = []
+
+    def add(ip, ev, host=''):
+        try:
+            a = ipaddress.ip_address(ip)
+        except ValueError:
+            return
+        if str(a) == edge or not a.is_global:
+            return
+        if _is_cdn_edge_ip(str(a)):
+            return  # another edge of the same class of mask, not the origin
+        rec = cand.setdefault(str(a), {'evidence': set(), 'names': set()})
+        rec['evidence'].add(ev)
+        if host:
+            rec['names'].add(host)
+
+    for dom in doms[:4]:
+        searched.append(dom)
+        for rec in _hostsearch_records(dom):
+            sub = rec['host'].split('.')[0]
+            add(rec['ip'], (f"origin-flavor subdomain '{rec['host']}'"
+                            if sub in _ORIGIN_SUB_HINTS else
+                            'hostsearch subdomain table'), rec['host'])
+        for rec in _rapiddns_subs(dom):
+            sub = rec['host'].split('.')[0]
+            add(rec['ip'], (f"origin-flavor subdomain '{rec['host']}'"
+                            if sub in _ORIGIN_SUB_HINTS else
+                            'subdomain record outside CDN range'), rec['host'])
+        for rec in _otx_domain_records(dom):
+            add(rec['ip'], 'passive-DNS history (pre-CDN resolution)', rec['host'])
+        for mxh in _mx_hosts(dom):
+            if _registrable_domain(mxh) == dom:
+                for a in _fwd_lookup_bounded(mxh, 4.0):
+                    add(a, f'MX record ({mxh})', mxh)
+        for net in _spf_addrs(dom):
+            if '/' in net:
+                try:
+                    n = ipaddress.ip_network(net, strict=False)
+                    if n.num_addresses <= 256:
+                        for a in list(n.hosts())[:64]:
+                            add(str(a), f'SPF netblock {net}')
+                except ValueError:
+                    pass
+            else:
+                add(net, 'SPF ip4 record')
+        for nm in _crtsh_names(dom):
+            sub = nm.split('.')[0]
+            if sub in _ORIGIN_SUB_HINTS and _registrable_domain(nm) == dom:
+                for a in _fwd_lookup_bounded(nm, 4.0):
+                    add(a, f"CT-logged hostname '{nm}'", nm)
+    return {'domains': searched, 'candidates': cand}
+
+
+def _verify_origin(ip: str, dom: str, edge_cert_sha: str,
+                   edge_meta: dict, timeout: float = 4.0) -> dict:
+    """Confirm a candidate is the real origin: (a) it serves the domain's
+    certificate (identical fingerprint to the edge presentation, or SAN
+    coverage for the domain), and/or (b) it answers an HTTP Host:<domain>
+    request with the same content the edge serves."""
+    out = {'tls_match': '', 'http_match': ''}
+    if not dom:
+        return out
+    c = _sni_cert(ip, dom, timeout=timeout)
+    if c.get('ok'):
+        if edge_cert_sha and c.get('sha256') == edge_cert_sha:
+            out['tls_match'] = 'identical certificate as the edge (same deployment)'
+        elif dom in c.get('san', []) or any(
+                _dom_suffix_match(dom, s.lstrip('*.')) for s in c.get('san', [])) \
+                or _dom_suffix_match(dom, c.get('cn', '').lstrip('*.')):
+            out['tls_match'] = f"serves cert for {dom} (CN={c.get('cn') or (c['san'] or ['?'])[0]})"
+        else:
+            out['tls_match'] = f"TLS up, cert CN={c.get('cn', '?')} (different cert)"
+    m = _http_meta(ip, 80, dom, timeout)
+    if m.get('title') and edge_meta.get('title') and m['title'] == edge_meta['title']:
+        out['http_match'] = f"serves identical page title '{m['title'][:60]}'"
+    elif m.get('hash') and m['hash'] == edge_meta.get('hash'):
+        out['http_match'] = 'serves byte-identical body'
+    elif m.get('status'):
+        out['http_match'] = f"answers HTTP ({m['status'][:40]})"
+    return out
+
+
+def _trace_origin_hunt(d: dict, probe: bool = True) -> dict:
+    """Find the real host behind a CDN/cloud edge. Every candidate is
+    public-record evidence; verification probes the candidate's own stack
+    so the result is proved, not inferred."""
+    res = _origin_candidates(d)
+    cand = res['candidates']
+    out: dict = {'domains': res['domains'], 'candidates': []}
+    edge_cert_sha, edge_meta = '', {}
+    if probe and cand and res['domains']:
+        dom0 = res['domains'][0]
+        ec = _sni_cert(d['ip'], dom0)
+        edge_cert_sha = ec.get('sha256', '')
+        edge_meta = _http_meta(d['ip'], 80, dom0)
+    for ip, rec in sorted(cand.items(), key=lambda kv: -len(kv[1]['evidence']))[:12]:
+        ent = {'ip': ip, 'evidence': sorted(rec['evidence']),
+               'names': sorted(rec['names'])[:4], 'tier': 'candidate',
+               'tls_match': '', 'http_match': '', 'asn': '', 'rdns': ''}
+        if len(rec['evidence']) >= 2:
+            ent['tier'] = 'strong'
+        if probe:
+            dom = next((rd for rd in res['domains']
+                        if any(_registrable_domain(n) == rd for n in rec['names'])),
+                       res['domains'][0] if res['domains'] else '')
+            ent.update(_verify_origin(ip, dom, edge_cert_sha, edge_meta))
+            if 'identical certificate' in ent['tls_match'] or \
+                    'identical' in ent['http_match']:
+                ent['tier'] = 'confirmed'
+            elif ent['tls_match'] or ent['http_match']:
+                ent['tier'] = 'verified'
+            try:
+                cy = cymru_asn_lookup(ip)
+                if cy:
+                    ent['asn'] = f"{cy.get('asn', '')} {cy.get('name', '')}".strip()
+            except Exception:
+                pass
+            ent['rdns'] = _rdns_bounded(ip, 2.5)
+        out['candidates'].append(ent)
+    return out
+
+
+def _render_origin(origin: dict, ind: str) -> list:
+    if not origin or not (origin.get('candidates') or origin.get('domains')):
+        return []
+    L = [ind + "-" * 60,
+         ind + "ORIGIN DISCOVERY — the host the CDN/cloud edge fronts for"]
+    if origin.get('domains'):
+        L.append(f"{ind}Domains checked : {', '.join(origin['domains'])}")
+    if not origin['candidates']:
+        L.append(f"{ind}No off-CDN address found in public records (subdomain "
+                 f"tables, MX, SPF, CT names, passive-DNS history) — the origin "
+                 f"is well-concealed; it exists only in the operator's map.")
+        return L
+    for c in origin['candidates'][:8]:
+        tail = ' — '.join(x for x in (c.get('rdns'), c.get('asn')) if x)
+        L.append(f"{ind}  {c['tier'].upper():<9} {c['ip']:<40} "
+                 f"{'; '.join(c['evidence'])[:90]}" + (f"   -> {tail}" if tail else ''))
+        for key in ('tls_match', 'http_match'):
+            if c.get(key):
+                L.append(f"{ind}  {'':<9} verified: {c[key]}")
+    conf = [c for c in origin['candidates'] if c['tier'] in ('confirmed', 'verified')]
+    if conf:
+        L.append(ind + f"  -> {len(conf)} verified origin(s): the edge fronts for "
+                 "the address(es) above — trace them with --trace to continue "
+                 "attribution past the CDN.")
+    else:
+        L.append(ind + "  -> candidates are public-record leads, not proof; "
+                 "verification probes could not confirm a deployment match.")
+    return L
+
+
+# ===================== OPEN-PROXY RELAY EGRESS TEST =====================
+# A misconfigured VPN exit, abused gateway or chained relay often listens
+# as an OPEN forward proxy. One standard request through it — CONNECT or
+# a proxy-style GET / SOCKS5 CONNECT — makes the relay itself fetch the
+# canary, and that fetch arrives at this host from the relay's UPSTREAM
+# egress: the next hop in the chain, exposed by the relay's own action.
+# Armed only when the canary listener is already running (the user opted
+# in); every attempt is one ordinary HTTP request on the observed port.
+
+_PROXY_RELAY_PORTS = (3128, 8080, 8888, 8118, 1080)
+
+
+def _proxy_relay_probe(ip: str, port: int = 0, timeout: float = 4.0) -> dict:
+    """Offer the endpoint a canary fetch to relay. Returns the ports/proto
+    that accepted the relay request; the canary registry then names the
+    egress address the relay really talks out of."""
+    cport = _canary_server.get('port') or 0
+    pub = _PUBLIC_IP_CACHE.get('ip') or _public_ip()
+    if not cport or not pub:
+        return {}
+    tok = CanaryRegistry.inst().mint(note=f'relay test via {ip}', target=ip)
+    url = f'http://{pub}:{cport}/c/{tok}'
+    out = {'token': tok, 'url': url, 'relayed': []}
+    fam = socket.AF_INET6 if ':' in ip else socket.AF_INET
+    ports = [port] if port in _PROXY_RELAY_PORTS else _PROXY_RELAY_PORTS
+
+    for p in ports:
+        try:
+            with socket.socket(fam, socket.SOCK_STREAM) as s:
+                s.settimeout(timeout)
+                s.connect((ip, p))
+                # 1) absolute-URI proxy GET — the form Squid/nginx take
+                s.sendall((f'GET {url} HTTP/1.1\r\nHost: {pub}:{cport}\r\n'
+                           'User-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n').encode())
+                r = s.recv(2048)
+                if r.startswith(b'HTTP/') and (b'ok' in r.lower() or b' 200' in r[:64]):
+                    out['relayed'].append({'port': p, 'proto': 'http-get'})
+                    continue
+        except (socket.timeout, OSError):
+            pass
+        try:
+            with socket.socket(fam, socket.SOCK_STREAM) as s:
+                s.settimeout(timeout)
+                s.connect((ip, p))
+                # 2) CONNECT tunnel, then the fetch inside it
+                s.sendall(f'CONNECT {pub}:{cport} HTTP/1.1\r\n'
+                          f'Host: {pub}:{cport}\r\n\r\n'.encode())
+                r = s.recv(1024)
+                if r.startswith(b'HTTP/') and b' 200' in r[:64]:
+                    s.sendall((f'GET /c/{tok} HTTP/1.1\r\nHost: {pub}:{cport}\r\n'
+                               'Connection: close\r\n\r\n').encode())
+                    body = s.recv(512)
+                    out['relayed'].append({'port': p, 'proto': 'http-connect',
+                                           'replied': body.startswith(b'HTTP/')})
+                    continue
+        except (socket.timeout, OSError):
+            pass
+        try:
+            with socket.socket(fam, socket.SOCK_STREAM) as s:
+                s.settimeout(timeout)
+                s.connect((ip, p))
+                # 3) SOCKS5 no-auth CONNECT
+                s.sendall(b'\x05\x01\x00')
+                greet = s.recv(8)
+                if greet[:2] != b'\x05\x00':
+                    continue
+                hb = socket.inet_aton(pub) if '.' in pub else None
+                if not hb:
+                    continue
+                s.sendall(b'\x05\x01\x00\x01' + hb + struct.pack('!H', cport))
+                rep = s.recv(16)
+                if len(rep) >= 2 and rep[0] == 5 and rep[1] == 0:
+                    s.sendall((f'GET /c/{tok} HTTP/1.1\r\nHost: {pub}:{cport}\r\n'
+                               'Connection: close\r\n\r\n').encode())
+                    body = s.recv(256)
+                    out['relayed'].append({'port': p, 'proto': 'socks5',
+                                           'replied': body.startswith(b'HTTP/')})
+        except (socket.timeout, OSError):
+            pass
+    return out
+
+
+# ===================== SELF-NAMING BATTERY (trace path) =====================
+# The inventory wave already carries ~40 endpoint self-ID probes; the trace
+# path was exercising only a few. _selfname_battery runs the whole
+# unauthenticated self-naming set against the traced endpoint — every
+# service that states its own name before any credential exists (NBNS name
+# table, SNMP sysName, SSDP friendlyName, SQL browser, DNS CHAOS
+# hostname.bind/version.bind, NTP stratum/refid, STUN/TURN software,
+# IKEv1 declared-ID, SMB NTLMSSP names+clock, LDAP rootDSE namingContexts,
+# Kerberos realm, RDP security stack, banner greets, service-ID probes,
+# VPN portals, OpenVPN mgmt, PPTP/L2TP). Bounded: ~20 probes, all
+# concurrent, ~4s worst case. Everything reported is something the
+# endpoint itself emitted.
+
+_SELFNAME_PROBES = (
+    ('selfname',   '_identity_probe'),   # NBNS/SNMP/NTP/SSDP/SSRP bundle
+    ('chaos',      '_dns_chaos_probe'),  # hostname.bind / version.bind / open-recursion
+    ('stun',       '_stun_probe'),       # TURN software + reflexive address
+    ('ike1',       '_ike1_probe'),       # legacy IPsec declared-ID
+    ('smb',        '_smb_probe'),        # NTLMSSP AV-pairs: NetBIOS+DNS names+clock
+    ('ldap',       '_ldap_probe'),       # rootDSE namingContexts/dnsHostName
+    ('krb',        '_krb_probe'),        # KRB_ERROR realm
+    ('rdp',        '_rdp_probe'),        # X.224 security stack
+    ('svc',        '_svc_ident_probe'),  # ES/Docker/Redis/K8s/... self-ID
+    ('banner',     '_banner_grab'),      # SSH/SMTP/FTP/POP3/IMAP greets
+    ('portal',     '_portal_probe'),     # SSTP/AnyConnect/Forti/GP/OpenVPN-AS pages
+    ('rtsp',       '_rtsp_probe'),       # camera/NVR Server banner
+    ('sip',        '_sipid_probe'),      # PBX/SBC OPTIONS banner
+    ('mqtt',       '_mqtt_probe'),       # broker CONNACK
+    ('db',         '_dbid_probe'),       # MySQL/PG/MSSQL greet
+    ('ovpnmgmt',   '_ovmgmt_probe'),     # OpenVPN mgmt interface
+    ('pptp',       '_pptp_probe'),       # PPTP control channel
+    ('l2tp',       '_l2tp_probe'),       # L2TP SCCRQ
+    ('h2fp',       '_h2fp_probe'),       # h2 SETTINGS fingerprint
+    ('quic',       '_quic_probe'),       # QUIC version-negotiation
+)
+
+
+def _selfname_battery(ip: str, budget_s: float = 6.0) -> dict:
+    """Run every unauthenticated self-naming probe against the endpoint,
+    concurrently, inside one wall-clock budget. Returns {channel: result}
+    for probes that produced anything — the endpoint naming itself."""
+    try:
+        mv = MultiVerifier()
+    except Exception:
+        return {}
+    out: dict = {}
+    lock = threading.Lock()
+
+    def _one(name, attr):
+        try:
+            r = getattr(mv, attr, None)
+            if r is None:
+                return
+            v = r(ip)
+            if v:
+                with lock:
+                    out[name] = v
+        except Exception:
+            pass
+
+    ths = [threading.Thread(target=_one, args=(n, a), daemon=True)
+           for n, a in _SELFNAME_PROBES]
+    for t in ths:
+        t.start()
+    deadline = time.time() + budget_s
+    for t in ths:
+        t.join(max(0.0, deadline - time.time()))
+    return out
+
+
+def _selfid_lines(selfid: dict) -> list:
+    """Flatten the battery's findings into one-line disclosures."""
+    L = []
+    idn = selfid.get('selfname') or {}
+    if idn.get('nbns_names'):
+        L.append(('NBNS', 'name table ' + '/'.join(idn['nbns_names'][:4])
+                  + (f"  MAC {idn['nbns_mac']} ({idn.get('nbns_vendor') or '?'})"
+                     if idn.get('nbns_mac') else '')))
+    if idn.get('snmp'):
+        L.append(('SNMP', '; '.join(str(x)[:60] for x in idn['snmp'][:2])))
+    if idn.get('ntp'):
+        n = idn['ntp']
+        L.append(('NTP', '  '.join(f'{k}={v}' for k, v in list(n.items())[:5])))
+    if idn.get('ssdp'):
+        s = idn['ssdp']
+        L.append(('SSDP', '  '.join(str(s.get(k, '')) for k in
+                  ('friendlyname', 'manufacturer', 'modelname', 'server') if s.get(k))[:110]))
+    if idn.get('ssrp'):
+        L.append(('SSRP', 'SQL browser: ' + str(idn['ssrp'].get('name', ''))[:80]))
+    ch = selfid.get('chaos') or {}
+    if ch.get('hostname'):
+        L.append(('CHAOS', f"hostname.bind '{ch['hostname']}'"))
+    if ch.get('version'):
+        L.append(('CHAOS', f"version.bind '{ch['version']}'"))
+    if ch.get('id'):
+        L.append(('CHAOS', f"id.server '{ch['id']}'"))
+    if ch.get('recursion'):
+        L.append(('CHAOS', 'OPEN RESOLVER — recurses for strangers'))
+    st = selfid.get('stun') or {}
+    if st:
+        L.append(('STUN', (st.get('software') or 'TURN/STUN service')
+                  + (f" (maps us {st.get('mapped')})" if st.get('mapped') else '')))
+    i1 = selfid.get('ike1') or {}
+    if i1.get('id'):
+        L.append(('IKEv1', f"declares ID '{i1['id']}'"))
+    smb = selfid.get('smb') or {}
+    if smb.get('name') or smb.get('dns_host'):
+        bits = ' '.join(str(smb.get(k, '')) for k in
+                        ('nb_domain', 'name', 'dns_host', 'dns_domain') if smb.get(k))
+        L.append(('SMB', f"NTLMSSP discloses {bits}"
+                  + (f"  clock-skew {smb['clock_skew_s']:+.0f}s"
+                     if smb.get('clock_skew_s') is not None else '')))
+    ld = selfid.get('ldap') or {}
+    if ld.get('dnsHostName') or ld.get('namingContexts'):
+        L.append(('LDAP', (ld.get('dnsHostName') or ld.get('namingContexts', ''))[:100]))
+    kb = selfid.get('krb') or {}
+    if kb.get('realm'):
+        L.append(('Kerberos', f"realm {kb['realm']}"))
+    rdp = selfid.get('rdp') or {}
+    if rdp:
+        L.append(('RDP', ' '.join(str(rdp.get(k, '')) for k in
+                  ('security', 'protocols', 'ver') if rdp.get(k))[:90]
+                  or 'X.224/RDP listener'))
+    sv = selfid.get('svc') or {}
+    for name, hit in list(sv.items())[:6]:
+        L.append((name.upper(), str({k: v for k, v in hit.items() if k != 'port'})[:100]))
+    for b in (selfid.get('banner') or [])[:4]:
+        L.append((f":{b.get('port')}", f"{b.get('banner', '')}"
+                  + (f"  [{b['os']}]" if b.get('os') else '')
+                  + (f"  host={b['host']}" if b.get('host') else '')))
+    for p in (selfid.get('portal') or [])[:4]:
+        L.append(('Portal', str(p)[:100]))
+    if selfid.get('rtsp'):
+        L.append(('RTSP', str(selfid['rtsp'])[:90]))
+    if selfid.get('sip'):
+        L.append(('SIP', str(selfid['sip'])[:90]))
+    if selfid.get('mqtt'):
+        L.append(('MQTT', str(selfid['mqtt'])[:90]))
+    for eng, hit in (selfid.get('db') or {}).items():
+        L.append(('DB', f"{eng}: {str(hit)[:80]}"))
+    if selfid.get('ovpnmgmt'):
+        L.append(('OpenVPN-mgm', str(selfid['ovpnmgmt'])[:90]))
+    if selfid.get('pptp'):
+        L.append(('PPTP', str(selfid['pptp'])[:90]))
+    if selfid.get('l2tp'):
+        L.append(('L2TP', str(selfid['l2tp'])[:90]))
+    if selfid.get('h2fp'):
+        L.append(('h2', str(selfid['h2fp'])[:90]))
+    if selfid.get('quic'):
+        L.append(('QUIC', str(selfid['quic'])[:90]))
+    return L
+
+
+def _selfid_names(selfid: dict) -> list:
+    """Pull the concrete names/identifiers the battery recovered —
+    hostnames, realms, usernames-of-record — for the de-masking tokens."""
+    out = []
+    idn = selfid.get('selfname') or {}
+    for n in (idn.get('nbns_names') or [])[:3]:
+        out.append(f"NBNS machine name '{n}'")
+    if idn.get('nbns_mac'):
+        out.append(f"NBNS adapter MAC {idn['nbns_mac']} ({idn.get('nbns_vendor') or '?'} hardware)")
+    s = idn.get('ssdp') or {}
+    for k in ('friendlyname', 'manufacturer', 'modelname'):
+        if s.get(k):
+            out.append(f"SSDP {k} '{s[k]}'")
+    ch = selfid.get('chaos') or {}
+    if ch.get('hostname'):
+        out.append(f"resolver hostname.bind '{ch['hostname']}'")
+    if ch.get('version'):
+        out.append(f"resolver version.bind '{ch['version']}'")
+    smb = selfid.get('smb') or {}
+    if smb.get('dns_host'):
+        out.append(f"SMB/NTLMSSP dns_host '{smb['dns_host']}'")
+    if smb.get('name'):
+        out.append(f"SMB/NTLMSSP NetBIOS name '{smb['name']}'")
+    if smb.get('nb_domain'):
+        out.append(f"SMB/NTLMSSP domain '{smb['nb_domain']}'")
+    ld = selfid.get('ldap') or {}
+    if ld.get('dnsHostName'):
+        out.append(f"LDAP dnsHostName '{ld['dnsHostName']}'")
+    if ld.get('namingContexts'):
+        out.append(f"LDAP namingContext '{str(ld['namingContexts'])[:60]}'")
+    kb = selfid.get('krb') or {}
+    if kb.get('realm'):
+        out.append(f"Kerberos realm '{kb['realm']}'")
+    st = selfid.get('stun') or {}
+    if st.get('software'):
+        out.append(f"TURN/STUN software '{st['software']}'")
+    i1 = selfid.get('ike1') or {}
+    if i1.get('id'):
+        out.append(f"IKEv1 declared-ID '{i1['id']}'")
+    return out[:14]
+
+
+# ===================== TRACE COVERAGE MATRIX =====================
+# "Run the battery at scale and measure what each channel recovers."
+# trace_matrix runs the full pipeline over a corpus of endpoints and
+# tallies per-channel yield: which channels named the operator, which
+# surfaced an origin/alias, which disclosed a self-name. This is the
+# measurable form of the de-masking goal — a scoreboard of recovered
+# identity, not a claim.
+
+def trace_matrix(targets: list, probe: bool = True, pivot: bool = False,
+                 budget_s: float = 300.0, workers: int = 6) -> dict:
+    """Run trace_data over a target corpus, tally per-channel yield.
+    Traces run concurrently (each is mostly I/O wait on remote sources),
+    so a corpus of dozens finishes in roughly one trace's wall time."""
+    per_channel: dict = {}
+    per_target: list = []
+    t0 = time.time()
+
+    def _trace_one(tgt):
+        d = trace_data(tgt, probe=probe, pivot=pivot, _path=False)
+        try:
+            GNAT.record('traces', dict(d, _matrix_target=tgt))
+        except Exception:
+            pass
+        return d
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    done: dict = {}
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+        futs = {ex.submit(_trace_one, t): t for t in targets}
+        for f in as_completed(futs):
+            tgt = futs[f]
+            if time.time() - t0 > budget_s:
+                per_target.append({'target': tgt, 'skipped': 'matrix budget exhausted'})
+                f.cancel()
+                continue
+            try:
+                done[tgt] = f.result()
+            except Exception as exc:
+                per_target.append({'target': tgt, 'error': str(exc)[:120]})
+    for tgt in targets:
+        d = done.get(tgt)
+        if d is None:
+            continue
+        row = {'target': tgt, 'ip': d.get('ip'), 'error': d.get('error')}
+        row['operator'] = ((d.get('operator') or {}).get('names') or
+                           [(d.get('registry') or {}).get('name') or ''])[0]
+        row['classified'] = list((d.get('classification') or {}).get('kinds', []))
+        um = d.get('unmask') or {}
+        row['origins'] = len(um.get('origins', []))
+        row['aliases'] = len(um.get('aliases', []))
+        row['tokens'] = len(um.get('tokens', []))
+        revealed = []
+        for c in um.get('channels', []):
+            name = c['name']
+            rec = per_channel.setdefault(name, {'checked': 0, 'revealed': 0})
+            rec['checked'] += 1
+            if c['result'].startswith('REVEALED'):
+                rec['revealed'] += 1
+                revealed.append(name)
+        # Public-record identity probes — measured like every other channel.
+        dis = d.get('disclose') or {}
+        for probe_key, fields in (
+                ('internetdb', ('hostnames', 'ports', 'cpes', 'tags', 'vulns')),
+                ('neighbors', ('neighbors', 'operator_names'))):
+            rec = per_channel.setdefault(
+                'record:' + probe_key, {'checked': 0, 'revealed': 0})
+            rec['checked'] += 1
+            hit = dis.get(probe_key) or {}
+            if any(hit.get(f) for f in fields):
+                rec['revealed'] += 1
+                if 'record:' + probe_key not in revealed:
+                    revealed.append('record:' + probe_key)
+        selfid = dis.get('selfid') or {}
+        for chan, val in selfid.items():
+            if val:
+                rec = per_channel.setdefault(f'selfid:{chan}', {'checked': 0, 'revealed': 0})
+                rec['checked'] += 1
+                rec['revealed'] += 1
+        row['revealed_channels'] = revealed
+        row['identified'] = bool(row['operator'] or row['origins'] or row['aliases'])
+        per_target.append(row)
+    n_id = sum(1 for r in per_target if r.get('identified'))
+    return {'targets': len(per_target), 'identified': n_id,
+            'channels': per_channel, 'rows': per_target,
+            'elapsed_s': round(time.time() - t0, 1)}
+
+
+def _render_matrix(m: dict) -> list:
+    L = ["TRACE COVERAGE MATRIX — per-channel identity-recovery yield",
+         "=" * 64,
+         f"Endpoints traced : {m['targets']}   operator/origin named: {m['identified']}   ({m['elapsed_s']}s)",
+         "-" * 64,
+         f"{'channel':<46} {'checked':>7} {'revealed':>8}",
+         "-" * 64]
+    for name, rec in sorted(m['channels'].items(),
+                            key=lambda kv: -kv[1]['revealed']):
+        L.append(f"{name:<46} {rec['checked']:>7} {rec['revealed']:>8}")
+    L.append("-" * 64)
+    for r in m['rows']:
+        if r.get('error') or r.get('skipped'):
+            L.append(f"  {r['target']:<40} {r.get('error') or r['skipped']}")
+            continue
+        tag = 'ID' if r['identified'] else '  '
+        L.append(f"  {tag} {r['target']:<38} {r.get('operator') or '':<30} "
+                 f"origins={r['origins']} aliases={r['aliases']} tokens={r['tokens']}")
+    return L
+
+
+# ===================== PARSER FUZZ HARNESS =====================
+# The measurable half of "test until it cannot fail": mutate captured and
+# generated replies through every wire parser, millions of iterations,
+# recording any exception or absurd output. A parser that survives the
+# corpus is proven safe against malformed endpoint replies — the class of
+# bug that would otherwise corrupt an attribution run mid-trace.
+
+def _fuzz_corpus() -> list:
+    """Seed corpus: real-shaped packets each parser is meant to read,
+    plus pathological cases. Every parser takes bytes."""
+    mv = MultiVerifier()
+    corpus = []
+    for fn, seeds in (
+        (_parse_nbns, [b'\x53\x42\x85\x00\x00\x00\x00\x01\x00\x00\x00\x00'
+                       + b'\x20CK' + b'A' * 30 + b'\x00\x00\x21\x00\x01'
+                       + b'\x00\x00\x00\x00\x00\xa0' + b'\x01' + b'NAME-PC' + b'\x00' * 20]),
+        (_parse_snmp, [b'\x30\x40\x02\x01\x00\x04\x06public\xa2\x33\x02\x04'
+                       + b'\x11\x22\x33\x44\x02\x01\x00\x02\x01\x00\x30\x25\x30\x23'
+                       + b'\x06\x08\x2b\x06\x01\x02\x01\x01\x01\x00\x04\x17Linux gw1 5.10.1']),
+        (_parse_ntp, [bytes([0x24, 1, 0, 0]) + b'\x00' * 44]),
+        (_parse_ssrp, [b'\x05\x2c\x00ServerName;GATEWAY;InstanceName;SQLEXPRESS;;']),
+        (_parse_stun_software, [b'\x01\x01\x00\x20\x21\x12\xa4\x42' + b'\x00' * 12
+                                + b'\x80\x22\x00\x0aCoturn-4.5\x00\x00']),
+        (_parse_stun_mapped, [b'\x01\x01\x00\x20\x21\x12\xa4\x42' + b'\x00' * 12
+                              + b'\x00\x20\x00\x08\x00\x01\x00\x00\x0a\x00\x00\x01']),
+        (_parse_ike1_id, [b'\x00' * 8 + b'\x11' * 8 + b'\x0d' + b'\x00' * 11
+                          + b'\x00\x00\x00\x1c\x05\x00\x00\x10\x01vpn.gw.example.com']),
+        (_ike1_reply_info, [b'\x00' * 8 + b'\x11' * 8 + b'\x0d' + b'\x00' * 11
+                            + b'\x00\x00\x00\x20\x05\x00\x00\x14\x01\x00\x00\x00' + b'\x0a\x00\x00\x01']),
+        (_ike2_reply_info, [b'\x00' * 8 + b'\x11' * 8 + b'\x23' + b'\x00' * 11
+                            + b'\x00\x00\x00\x28\x29\x00\x00\x14' + b'\x00' * 4
+                            + b'\x00\x00\x40\x00' + b'\x00' * 8]),
+        (_banner_guess, [b'SSH-2.0-OpenSSH_9.2p1 Debian-2+deb12u2',
+                         b'220 mail.corp.example ESMTP Postfix',
+                         b'HTTP/1.1 200 OK\r\nServer: nginx/1.24.0\r\n\r\n']),
+        (_parse_http_xff, [b'HTTP/1.1 200 OK\r\nX-Forwarded-For: 203.0.113.7, 10.0.0.1\r\n\r\n',
+                           b'HTTP/1.1 200 OK\r\nCF-Connecting-IP: 198.51.100.44\r\n\r\n',
+                           b'HTTP/1.1 200 OK\r\nForwarded: for=192.0.2.9;proto=https\r\n\r\n']),
+        (_parse_sip_leak, [b'SIP/2.0 200 OK\r\nVia: SIP/2.0/UDP 192.168.1.5:5060\r\n'
+                           b'Contact: <sip:u@10.1.2.3:5060>\r\n\r\n']),
+        (_mdns_ptr_names, [b'\x00\x00\x84\x00\x00\x00\x00\x01\x00\x00\x00\x00'
+                           + b'\x0b_printer\x04_tcp\x05local\x00\x00\x0c\x00\x01'
+                           + b'\xc0\x0c\x00\x0c\x00\x01\x00\x00\x00\x78\x00\x11'
+                           + b'\x08printer1\xc0\x19']),
+        (mv._krb_realm, [b'\x7e\x30\x02\x01\x05\xa3\x1bCORP.EXAMPLE.COM']),
+        (mv._ntlm_av_pairs, [b'NTLMSSP\x00\x02\x00\x00\x00'
+                             + b'\x02\x00\x0a\x00GATEWAY\x01\x00\x08\x00WORKGROUP'
+                             + b'\x04\x00\x12\x00gw1.corp.example\x00\x00\x00\x00']),
+        (mv._mysql_greet, [b'\x4a\x00\x00\x00\x0a8.0.35\x00' + b'\x01\x00\x00\x00' + b'\x00' * 30]),
+    ):
+        for s in seeds:
+            corpus.append((fn.__name__, fn, bytes(s)))
+    return corpus
+
+
+def trace_fuzz(iterations: int = 200000, seed: Optional[int] = None) -> dict:
+    """Mutation-fuzz every wire parser `iterations` times. Returns
+    {parser: {'runs': n, 'errors': [(exc, input_hex)]}} — an empty
+    errors list means the parser is safe against malformed replies."""
+    import random as _rnd
+    rng = _rnd.Random(seed)
+    corpus = _fuzz_corpus()
+    stats = {name: {'runs': 0, 'errors': []} for name, _, _ in corpus}
+    per = max(1, iterations // len(corpus))
+    for name, fn, seed_pkt in corpus:
+        fnname = name
+        for _ in range(per):
+            stats[fnname]['runs'] += 1
+            # mutation strategy: truncate / extend / bitflip / splice
+            buf = bytearray(seed_pkt)
+            mode = rng.randrange(5)
+            if mode == 0 and buf:
+                buf = buf[:rng.randrange(len(buf))]
+            elif mode == 1:
+                buf += bytes(rng.randrange(256) for _ in range(rng.randrange(1, 64)))
+            elif mode == 2 and buf:
+                for _ in range(rng.randrange(1, 9)):
+                    buf[rng.randrange(len(buf))] ^= 1 << rng.randrange(8)
+            elif mode == 3:
+                other = corpus[rng.randrange(len(corpus))][2]
+                buf = buf + other[:rng.randrange(1, len(other) + 1)]
+            else:
+                buf = bytearray(rng.randrange(256)
+                                for _ in range(rng.randrange(0, 256)))
+            try:
+                fn(bytes(buf))
+            except Exception as exc:
+                stats[fnname]['errors'].append((f'{type(exc).__name__}: {exc}',
+                                                bytes(buf)[:40].hex()))
+    total = sum(v['runs'] for v in stats.values())
+    nerr = sum(len(v['errors']) for v in stats.values())
+    return {'iterations': total, 'errors': nerr, 'per_parser': stats}
+
+
+# ===================== TIER-1 DE-MASK ENGINE =====================
+# Everything here runs from THIS host alone — it turns the canary listener
+# into a destination that makes the subscriber's own stack reveal the
+# pre-tunnel address: WebRTC ICE harvest (srflx candidates are the real
+# egress on a misconfigured/leaking client), session-fingerprint linkage
+# (same browser at two different egresses is one client), an authoritative
+# DNS responder for the canary zone (the RESOLVER egress that queries is a
+# de-mask when the subscriber's real resolver answers), and an injected
+# flow watermark whose rhythm survives the tunnel.
+
+
+class SessionRegistry:
+    """Fingerprint -> every egress the same client appeared from. A client
+    that shows one fingerprint from a VPN exit and later from a residential
+    IP is unmasked by its own browser — the tunnel changes the route, not
+    the fingerprint."""
+    _inst: Optional['SessionRegistry'] = None
+
+    def __init__(self):
+        self.fp: dict = {}          # fp_hash -> {'ips': set, 'ua': str, 'first': t, 'last': t, 'n': int}
+        self.lock = threading.Lock()
+
+    @classmethod
+    def inst(cls) -> 'SessionRegistry':
+        if cls._inst is None:
+            cls._inst = cls()
+        return cls._inst
+
+    def observe(self, fp_hash: str, ip: str, ua: str = '') -> dict:
+        if not fp_hash:
+            return {}
+        with self.lock:
+            rec = self.fp.setdefault(fp_hash,
+                                     {'ips': set(), 'ua': ua[:120], 'first': time.time(),
+                                      'last': time.time(), 'n': 0})
+            rec['ips'].add(ip)
+            rec['last'] = time.time()
+            rec['n'] += 1
+            linked = sorted(rec['ips'] - {ip})
+            return {'n_egress': len(rec['ips']), 'linked_ips': linked[:12]}
+
+    def links_for(self, ip: str) -> list:
+        out = []
+        with self.lock:
+            for h, rec in self.fp.items():
+                if ip in rec['ips'] and len(rec['ips']) > 1:
+                    out.append({'fp': h[:12], 'ips': sorted(rec['ips'])[:12],
+                                'ua': rec['ua'], 'n': rec['n']})
+        return out
+
+
+SESSIONS = SessionRegistry()
+
+
+# ---------- flow watermarking ----------
+def _wm_gaps(seed: str, n: int = 14) -> list:
+    """Deterministic inter-burst gap schedule (ms) for a token — the
+    watermark we inject. Values sit on a coarse grid so they survive
+    tunnel jitter yet stay distinguishable."""
+    rng = random.Random(hashlib.sha256(seed.encode()).digest())
+    return [25 + 25 * rng.randrange(8) for _ in range(n)]
+
+
+def wm_correlate(observed_gaps: list, pattern: list) -> float:
+    """Score 0..1: how closely an observed gap series matches a pattern we
+    injected. Normalized mean absolute error on the coarse grid, then a
+    sign-agreement bonus — a real match agrees on rhythm, not just mean."""
+    if len(observed_gaps) < 6 or len(pattern) < 6:
+        return 0.0
+    n = min(len(observed_gaps), len(pattern))
+    obs = [max(0.0, float(g)) for g in observed_gaps[:n]]
+    pat = [float(g) for g in pattern[:n]]
+    mo = statistics.mean(obs) or 1.0
+    mp = statistics.mean(pat) or 1.0
+    obs_n = [g / mo for g in obs]
+    pat_n = [g / mp for g in pat]
+    err = sum(abs(a - b) for a, b in zip(obs_n, pat_n)) / n
+    agree = sum(1 for a, b in zip(obs_n, pat_n)
+                if (a > 1) == (b > 1)) / n
+    return max(0.0, min(1.0, (1.0 - err) * 0.6 + agree * 0.4))
+
+
+class FlowCorrelator:
+    """Registry of injected watermarks + observed flow-timing series.
+    A vantage point (this host's sniffer, or a cooperating monitor posting
+    to /v/) supplies (ts,size) series; correlate() scores each against
+    every watermark we injected — DeepCorr-lite. A match says: the same
+    flow was seen at both points — the two observation points are joined
+    and the flow's true endpoints are pinned."""
+    _inst: Optional['FlowCorrelator'] = None
+
+    def __init__(self):
+        self.patterns: dict = {}    # wm_id -> {'gaps': [...], 'note': str, 'target': str}
+        self.flows: dict = {}       # flow_id -> {'gaps': [...], 'src': str, 'n': int}
+        self.matches: list = []
+        self.lock = threading.Lock()
+
+    @classmethod
+    def inst(cls) -> 'FlowCorrelator':
+        if cls._inst is None:
+            cls._inst = cls()
+        return cls._inst
+
+    def inject(self, wm_id: str, target: str = '', note: str = '') -> list:
+        gaps = _wm_gaps(wm_id)
+        with self.lock:
+            self.patterns[wm_id] = {'gaps': gaps, 'target': target,
+                                    'note': note, 'ts': time.time()}
+        return gaps
+
+    def record_flow(self, flow_id: str, gaps_ms: list, src: str = 'local') -> dict:
+        """Record an observed inter-arrival gap series. Returns the best
+        injected-watermark match if it exceeds the acceptance threshold."""
+        gaps = [float(g) for g in gaps_ms[:64] if g and g > 0]
+        best = (0.0, '')
+        if len(gaps) >= 6:
+            with self.lock:
+                pats = dict(self.patterns)
+            for wid, rec in pats.items():
+                s = wm_correlate(gaps, rec['gaps'])
+                if s > best[0]:
+                    best = (s, wid)
+        with self.lock:
+            self.flows[flow_id] = {'gaps': gaps, 'src': src,
+                                   'n': len(gaps), 'ts': time.time()}
+            if len(self.flows) > 4000:
+                self.flows.pop(next(iter(self.flows)))
+            if best[0] >= 0.72:
+                m = {'flow': flow_id, 'wm': best[1], 'score': round(best[0], 3),
+                     'src': src, 'ts': time.time()}
+                self.matches.append(m)
+                self.matches = self.matches[-400:]
+        return {'score': round(best[0], 3), 'wm': best[1],
+                'matched': best[0] >= 0.72}
+
+    def matches_for(self, ip: str) -> list:
+        with self.lock:
+            return [m for m in self.matches if ip in (m.get('flow', ''), m.get('wm', ''))]
+
+
+FLOWCORR = FlowCorrelator()
+
+
+# ---------- DNS leak authority ----------
+_demask_dns: dict = {'sock': None, 'port': 0, 'zone': '', 'hits': []}
+
+
+def _demask_dns_listen(zone: str, port: int = 53) -> int:
+    """Authoritative DNS responder for the canary zone. A subscriber's
+    stub resolver never talks to us directly — the RESOLVER that queries
+    here is its real egress, and any EDNS client-subnet option the query
+    carries names the client network itself. Returns the bound port, 0
+    if :53 can't be bound (needs admin)."""
+    if _demask_dns['sock'] is not None:
+        return _demask_dns['port']
+    _demask_dns['zone'] = zone.lower().rstrip('.')
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.bind(('0.0.0.0', port))
+        s.settimeout(0.5)
+    except OSError:
+        return 0
+    _demask_dns['sock'] = s
+    _demask_dns['port'] = port
+
+    def _ecs(data: bytes):
+        """Pull EDNS client-subnet out of the additional section."""
+        try:
+            an = struct.unpack('!H', data[10:12])[0] if len(data) >= 12 else 0
+            qd = struct.unpack('!H', data[4:6])[0]
+            off = 12
+            for _ in range(qd):
+                off = _dns_skip_name(data, off) + 4
+            skip = struct.unpack('!HH', data[6:10])
+            for _ in range(sum(skip)):
+                off = _dns_skip_name(data, off)
+                if off + 10 > len(data):
+                    return ''
+                rdlen = struct.unpack('!H', data[off + 8:off + 10])[0]
+                off += 10 + rdlen
+            for _ in range(min(an, 4)):
+                off = _dns_skip_name(data, off)
+                if off + 11 > len(data):
+                    return ''
+                rtype, _c, _t, rdlen = struct.unpack('!HHIH', data[off:off + 10])
+                rd = data[off + 10:off + 10 + rdlen]
+                off += 10 + rdlen
+                if rtype != 41:
+                    continue
+                i = 4
+                while i + 4 <= len(rd):
+                    ocode, olen = struct.unpack('!HH', rd[i:i + 4])
+                    obody = rd[i + 4:i + 4 + olen]
+                    i += 4 + olen
+                    if ocode == 8 and len(obody) >= 4:
+                        fam, sb, _sm, alen = struct.unpack('!HBBB', obody[:4])
+                        nb = (alen + 7) // 8
+                        raw = obody[4:4 + nb] + b'\x00' * ((16 if fam == 2 else 4) - nb)
+                        try:
+                            a = ipaddress.ip_address(raw)
+                            return f'{a}/{sb}'
+                        except ValueError:
+                            return ''
+        except Exception:
+            pass
+        return ''
+
+    def _loop():
+        while _demask_dns['sock'] is s:
+            try:
+                data, addr = s.recvfrom(2048)
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            try:
+                # qname decode
+                _, off = _dns_read_name(data, 12)
+                qname = ''
+                j = 12
+                while j < len(data) and data[j]:
+                    ln = data[j]
+                    if ln & 0xC0 or j + 1 + ln > len(data):
+                        break
+                    qname += data[j + 1:j + 1 + ln].decode('ascii', 'replace') + '.'
+                    j += 1 + ln
+                qname = qname.rstrip('.').lower()
+                if not qname.endswith(_demask_dns['zone']):
+                    continue
+                ecs = _ecs(data)
+                _demask_dns['hits'].append(
+                    {'resolver': addr[0], 'qname': qname, 'ecs': ecs,
+                     'ts': time.time()})
+                _demask_dns['hits'] = _demask_dns['hits'][-400:]
+                # Answer with a parked address so the chain completes.
+                resp = (data[:2] + b'\x85\x80\x00\x01\x00\x01\x00\x00\x00\x00'
+                        + data[12:off]
+                        + b'\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04'
+                        + b'\xcb\x00\x71\x4d')          # 203.0.113.77
+                try:
+                    s.sendto(resp, addr)
+                except OSError:
+                    pass
+            except Exception:
+                continue
+    threading.Thread(target=_loop, daemon=True, name='Demask-DNS').start()
+    return port
+
+
+def _demask_dns_hits() -> list:
+    return list(_demask_dns['hits'])
+
+
+# ---------- the de-mask page ----------
+_DEMASK_PAGE = """<!doctype html><meta charset=utf-8><title>d</title>
+<script>
+(function(){
+var tok = "%(TOK)s";
+var out = {ice:[], fp:{}};
+function post(u,b){try{var x=new XMLHttpRequest();x.open('POST',u,true);
+x.setRequestHeader('Content-Type','text/plain');x.send(b)}catch(e){}}
+try{
+ var pc = new RTCPeerConnection({iceServers:[{urls:['stun:stun.l.google.com:19302']}]});
+ pc.createDataChannel('x');
+ pc.onicecandidate=function(e){
+   if(e.candidate){var c=e.candidate.candidate;
+     var m=/([0-9a-fA-F:.]+) \\d+ typ (host|srflx|relay)/.exec(c);
+     if(m)out.ice.push({addr:m[1],typ:m[2]});
+   }else{fin()}};
+ pc.createOffer().then(function(o){pc.setLocalDescription(o)}).catch(fin);
+}catch(e){fin()}
+try{
+ var c=document.createElement('canvas');c.width=240;c.height=40;
+ var g=c.getContext('2d');g.textBaseline='top';g.font='14px Arial';
+ g.fillStyle='#f60';g.fillRect(0,0,80,20);g.fillStyle='#069';
+ g.fillText('demask#',6,16);
+ out.fp.canvas=c.toDataURL().length;
+ out.fp.ua=navigator.userAgent;
+ out.fp.tz=new Date().getTimezoneOffset();
+ out.fp.lang=navigator.language;
+ out.fp.cores=navigator.hardwareConcurrency||0;
+ out.fp.mem=navigator.deviceMemory||0;
+ out.fp.screen=[screen.width,screen.height,screen.colorDepth].join('x');
+ out.fp.plat=navigator.platform||'';
+}catch(e){}
+var _done=false;
+function fin(){if(_done)return;_done=true;
+ post('/l/'+tok,JSON.stringify(out))}
+setTimeout(fin,3500);
+})();
+</script>
+"""
+
+# ---------- extended canary handler (de-mask endpoints) ----------
+class _DemaskHandler:
+    """The canary handler grown into a full de-mask destination:
+      /c/<tok>  classic callback — fetcher's real egress (breakthrough flag)
+      /d/<tok>  de-mask page — WebRTC ICE harvest + browser fingerprint,
+                posted back to /l/<tok>; host candidates on a leaking
+                client are the pre-tunnel LAN/WAN address, srflx on a
+                misconfigured client is the real public egress
+      /l/<tok>  leak intake — JSON {ice:[{addr,typ}], fp:{…}}
+      /w/<tok>  watermarked response — bursts paced on _wm_gaps(tok);
+                the rhythm survives the tunnel and a second vantage can
+                confirm the same flow by correlation
+      /f/<tok>  flow observation intake — a cooperating vantage posts
+                {gaps:[ms…]} and gets the correlation score back
+      /s/<tok>  session link — sets a sticky cookie+ETag so a client seen
+                at two egresses is joined by its own fingerprint
+    """
+
+    @staticmethod
+    def make(registry):
+        from http.server import BaseHTTPRequestHandler
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def _hdrs(self):
+                return {k.lower(): v for k, v in self.headers.items()}
+
+            def _send(self, code, body, ctype='text/html', extra=None):
+                self.send_response(code)
+                self.send_header('Content-Type', ctype)
+                for k, v in (extra or {}).items():
+                    self.send_header(k, v)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _body(self):
+                try:
+                    n = int(self.headers.get('Content-Length') or 0)
+                    return self.rfile.read(min(n, 65536)) if n else b''
+                except Exception:
+                    return b''
+
+            def _record_fp(self, tok, ip, fp):
+                """Fingerprint linkage: hash the browser fp, join every
+                egress it has ever been seen from."""
+                try:
+                    key_src = '|'.join(str(fp.get(k, '')) for k in
+                                       ('canvas', 'ua', 'tz', 'lang', 'cores',
+                                        'mem', 'screen', 'plat'))
+                    h = hashlib.sha256(key_src.encode()).hexdigest()[:24]
+                    return SESSIONS.observe(h, ip, ua=str(fp.get('ua', '')))
+                except Exception:
+                    return {}
+
+            def _leak_report(self, tok, ip, body, hdrs):
+                reg = CanaryRegistry.inst()
+                out = {'ice': [], 'fp_link': {}}
+                try:
+                    data = json.loads(body.decode('utf-8', 'replace') or '{}')
+                except Exception:
+                    data = {}
+                for c in (data.get('ice') or [])[:16]:
+                    a = str(c.get('addr', ''))
+                    try:
+                        ipa = ipaddress.ip_address(a)
+                    except ValueError:
+                        continue
+                    if ipa.is_global and a != ip:
+                        out['ice'].append({'addr': a, 'typ': c.get('typ', ''),
+                                           'public': True})
+                    elif not ipa.is_global:
+                        out['ice'].append({'addr': a, 'typ': c.get('typ', ''),
+                                           'public': False})
+                if out['ice']:
+                    reg.hits.append({
+                        'time': datetime.datetime.now(datetime.timezone.utc)
+                        .isoformat(timespec='seconds'),
+                        'token': tok, 'ip': ip, 'port': 0,
+                        'ua': hdrs.get('user-agent', '')[:160],
+                        'lang': hdrs.get('accept-language', '')[:60],
+                        'referer': '', 'for': 'webrtc-leak',
+                        'breakthrough': True,
+                        'leaked': out['ice']})
+                    _logger.info('DEMASK LEAK %s: %s', tok,
+                                 ', '.join(f"{c['addr']}({c['typ']})" for c in out['ice']))
+                out['fp_link'] = self._record_fp(tok, ip, data.get('fp') or {})
+                return out
+
+            def do_GET(self):
+                p = self.path
+                hdrs = self._hdrs()
+                ip = self.client_address[0]
+                m = re.match(r'^/c/([0-9a-f]{8,32})$', p)
+                if m:
+                    registry.hit(m.group(1), ip, self.client_address[1], hdrs)
+                    xff = _parse_http_xff(b'GET / HTTP/1.1\r\n' +
+                                          b'\r\n'.join(f'{k}: {v}'.encode()
+                                                       for k, v in self.headers.items()) +
+                                          b'\r\n\r\n')
+                    if xff and xff != ip:
+                        CanaryRegistry.inst().hits.append(
+                            {'time': datetime.datetime.now(datetime.timezone.utc)
+                             .isoformat(timespec='seconds'), 'token': m.group(1),
+                             'ip': xff, 'port': 0, 'ua': hdrs.get('user-agent', ''),
+                             'lang': '', 'referer': '', 'for': 'xff-leak',
+                             'breakthrough': True, 'via_ip': ip})
+                    body = b'<!doctype html><title>ok</title>'
+                    self._send(200, body)
+                    return
+                m = re.match(r'^/d/([0-9a-f]{8,32})$', p)
+                if m:
+                    tok = m.group(1)
+                    registry.hit(tok, ip, self.client_address[1], hdrs)
+                    body = _DEMASK_PAGE.replace('%(TOK)s', tok).encode()
+                    # watermark the response itself — chunked pacing
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'text/html')
+                    self.send_header('Transfer-Encoding', 'chunked')
+                    self.send_header('Set-Cookie', f'__mbx_s={tok}; Path=/')
+                    self.end_headers()
+                    gaps = FLOWCORR.inject(tok, target=ip,
+                                           note='demask-page pacing')
+                    i = 0
+                    n_chunks = min(len(gaps), 12)
+                    step = max(1, len(body) // n_chunks)
+                    for k in range(n_chunks):
+                        piece = body[i:i + step]
+                        i += step
+                        if piece:
+                            self.wfile.write(f'{len(piece):x}\r\n'.encode()
+                                             + piece + b'\r\n')
+                            self.wfile.flush()
+                        time.sleep(gaps[k] / 1000.0)
+                    if i < len(body):
+                        rest = body[i:]
+                        self.wfile.write(f'{len(rest):x}\r\n'.encode()
+                                         + rest + b'\r\n')
+                    self.wfile.write(b'0\r\n\r\n')
+                    return
+                m = re.match(r'^/s/([0-9a-f]{8,32})$', p)
+                if m:
+                    tok = m.group(1)
+                    etag = f'W/"mbx-{tok}"'
+                    inm = hdrs.get('if-none-match', '')
+                    fp_link = self._record_fp(
+                        tok, ip, {'ua': hdrs.get('user-agent', ''),
+                                  'lang': hdrs.get('accept-language', ''),
+                                  'tz': hdrs.get('x-mbx-tz', '')})
+                    if etag in inm:
+                        self._send(304, b'', extra={'ETag': etag})
+                        return
+                    registry.hit(tok, ip, self.client_address[1], hdrs)
+                    body = b'\x89PNG\r\n\x1a\n' + b'\x00' * 24
+                    self._send(200, body, ctype='image/png',
+                               extra={'ETag': etag, 'Cache-Control': 'no-cache',
+                                      'Set-Cookie': f'__mbx_s={tok}; Path=/'})
+                    return
+                self._send(404, b'not found')
+
+            def do_POST(self):
+                p = self.path
+                hdrs = self._hdrs()
+                ip = self.client_address[0]
+                body = self._body()
+                m = re.match(r'^/l/([0-9a-f]{8,32})$', p)
+                if m:
+                    rep = self._leak_report(m.group(1), ip, body, hdrs)
+                    out = json.dumps({'ok': True,
+                                      'leaks': rep['ice'],
+                                      'linked': rep['fp_link']}).encode()
+                    self._send(200, out, ctype='application/json')
+                    return
+                m = re.match(r'^/f/([0-9a-f]{8,32})$', p)
+                if m:
+                    try:
+                        data = json.loads(body.decode('utf-8', 'replace') or '{}')
+                    except Exception:
+                        data = {}
+                    gaps = [float(g) for g in (data.get('gaps') or [])[:64]
+                            if isinstance(g, (int, float)) and g > 0]
+                    r = FLOWCORR.record_flow(
+                        f"{data.get('src') or 'vantage'}:{m.group(1)}",
+                        gaps, src=str(data.get('src') or 'vantage'))
+                    self._send(200, json.dumps(r).encode(),
+                               ctype='application/json')
+                    return
+                self._send(404, b'not found')
+        return H
+
+
+# ===================== TIER-3: TOR-SIDE EXPOSURE =====================
+
+_GUARD_CENSUS_CACHE: dict = {'ts': 0.0, 'data': {}}
+
+
+def tor_guard_census() -> dict:
+    """The guard-population model behind guard-discovery narrowing: fetch
+    the current guard set + consensus weights, estimate client population
+    share per guard. A client observed to enter through guard G is
+    narrowed to G's share of all Tor clients — real localization data.
+    Cached 10 min — the consensus changes hourly, not per trace."""
+    if time.time() - _GUARD_CENSUS_CACHE['ts'] < 600 and _GUARD_CENSUS_CACHE['data']:
+        return dict(_GUARD_CENSUS_CACHE['data'])
+    out = {'guards': 0, 'top': [], 'est_clients_millions': 2.0}
+    data = _trace_fetch(
+        'https://onionoo.torproject.org/details?type=relay&running=true&flag=guard&fields=nickname,guard_probability,advertised_bandwidth', 12.0)
+    rels = (data or {}).get('relays') or []
+    out['guards'] = len(rels)
+    rows = []
+    for r in rels:
+        p = r.get('guard_probability') or 0.0
+        if p:
+            rows.append((float(p), r.get('nickname', '?')))
+    rows.sort(reverse=True)
+    out['top'] = [{'nickname': n, 'guard_probability': round(p, 5),
+                   'est_population_share_pct': round(p * 100, 2)}
+                  for p, n in rows[:12]]
+    if out['guards']:
+        _GUARD_CENSUS_CACHE.update(ts=time.time(), data=dict(out))
+    return out
+
+
+def _tor_relay_observe() -> dict:
+    """If THIS host runs a Tor relay, inbound OR-port connections from
+    non-relay addresses are clients using us as their entry guard — the
+    guard position sees the client directly. Detect a local tor process
+    and its ORPort, then every remote that opens it is exposed."""
+    out = {'running': False, 'orport': 0, 'clients': []}
+    try:
+        for p in psutil.process_iter(['pid', 'name']):
+            nm = (p.info.get('name') or '').lower()
+            if nm in ('tor', 'tor.exe'):
+                out['running'] = True
+                out['pid'] = p.info.get('pid')
+                break
+    except Exception:
+        pass
+    if not out['running']:
+        return out
+    try:
+        for c in psutil.net_connections(kind='inet'):
+            if not c.raddr or c.type != socket.SOCK_STREAM:
+                continue
+            try:
+                lp = c.laddr.port if c.laddr else 0
+            except Exception:
+                continue
+            if lp in (9001, 9030, 443) and c.pid == out.get('pid'):
+                out['orport'] = lp
+                try:
+                    ra = ipaddress.ip_address(c.raddr.ip)
+                    if ra.is_global:
+                        out['clients'].append({'ip': c.raddr.ip,
+                                               'port': c.raddr.port,
+                                               'status': c.status})
+                except ValueError:
+                    pass
+    except Exception:
+        pass
+    out['clients'] = out['clients'][:50]
+    return out
+
+
+def sybil_census() -> dict:
+    """Our own relay fingerprints from CONFIG['our_tor_relays']. When the
+    same client path lands on a relay we run at BOTH positions, the
+    correlation is ours alone — this census just names the position."""
+    relays = CONFIG.get('our_tor_relays') or []
+    out = {'configured': len(relays), 'relays': [], 'matches': []}
+    if not relays:
+        return out
+    fps = {str(r).upper().replace(' ', '') for r in relays}
+    data = _trace_fetch(
+        'https://onionoo.torproject.org/details?type=relay&running=true&fields=fingerprint,nickname,flags,guard_probability,exit_probability', 12.0)
+    for r in (data or {}).get('relays') or []:
+        if (r.get('fingerprint') or '').upper() in fps:
+            out['relays'].append({'nickname': r.get('nickname', '?'),
+                                  'flags': r.get('flags', []),
+                                  'guard_p': r.get('guard_probability', 0),
+                                  'exit_p': r.get('exit_probability', 0)})
+    out['covers_entry'] = any('Guard' in r['flags'] for r in out['relays'])
+    out['covers_exit'] = any('Exit' in r['flags'] for r in out['relays'])
+    return out
+
+
+def _demask_for_trace(ip: str) -> dict:
+    """Assemble the de-mask state for one traced endpoint: canary URL,
+    demask page URL, watermark id, any hits/leaks already received, flow
+    correlations, DNS-resolver leaks, and Tor-side exposure."""
+    port = _canary_server.get('port') or 0
+    out = {'armed': bool(port)}
+    if not port:
+        return out
+    pub = _public_ip() or '<public-ip>'
+    tok = CanaryRegistry.inst().mint(note=f'demask of {ip}', target=ip)
+    out['url'] = f'http://{pub}:{port}/d/{tok}'
+    out['plain_url'] = f'http://{pub}:{port}/c/{tok}'
+    out['pixel_url'] = f'http://{pub}:{port}/s/{tok}'
+    out['watermark'] = tok
+    reg = CanaryRegistry.inst()
+    hits = [h for h in reg.hits if h.get('for') and ip in str(h.get('for', ''))
+            or h.get('ip') == ip or ip in str(h.get('via_ip', ''))]
+    out['hits'] = hits[-10:]
+    leaks = [l for h in hits for l in (h.get('leaked') or [])]
+    out['ice_leaks'] = leaks[:12]
+    out['fp_links'] = SESSIONS.links_for(ip)[:8]
+    out['flow_matches'] = FLOWCORR.matches_for(ip)[:8]
+    if _demask_dns['sock'] is not None:
+        out['dns_leaks'] = _demask_dns_hits()[-10:]
+    return out
+
+def identify_probe(seconds: int = 60, dump: str = '') -> dict:
+    """Live identification coverage probe: run the monitor's connection
+    mapper + inventory threads for SECONDS, then report how many real
+    public connections remain unidentified — the measurable form of
+    'identify everything labeled unknown'."""
+    CONFIG['dashboard_enabled'] = False
+    mon_args = type('A', (), {'no_gui': True, 'config': None, 'no_dashboard': True,
+                              'no_geoip': False, 'siem': None, 'port': None,
+                              'workers': None, 'dashboard_password': None,
+                              'geoip_db': None})()
+    mon = MedianBoxMonitor(mon_args)
+    for t, n in ((mon._connection_mapper, 'map'), (mon._process_watcher, 'proc'),
+                 (mon._dns_cache_poll_thread, 'dns'), (mon.conn_inventory.run_thread, 'inv')):
+        threading.Thread(target=t, daemon=True, name=n).start()
+    time.sleep(seconds)
+    conns = mon.conn_inventory.get_all()
+    if dump:
+        with open(dump, 'w', encoding='utf-8') as fh:
+            json.dump(conns, fh, default=str, indent=1)
+    pub = [c for c in conns if _is_public_ip_cached(c['remote_ip'])]
+    priv = [c for c in conns if not _is_public_ip_cached(c['remote_ip'])]
+    via = Counter((c['via'] or 'DNS/SNI') for c in pub)
+    unres = [c for c in pub if c['service'] == 'Unknown'
+             or c['service'].startswith('Unresolved') or c['service'] == c['remote_ip']]
+    return {'total': len(conns), 'public': len(pub), 'private': len(priv),
+            'unresolved_public': [f"{c['remote_ip']}:{c['remote_port']} {c['process']} "
+                                  f"| {c['service']} | {c['org']}" for c in unres[:15]],
+            'via': dict(via),
+            'weak': [f"{c['remote_ip']} {c['org']}" for c in pub
+                     if c['via'] == 'registered network owner'][:25]}
+
+
+def _render_identify_probe(r: dict) -> list:
+    L = [f"IDENTIFY PROBE total={r['total']} public={r['public']} "
+         f"private={r['private']} unresolved_public={len(r['unresolved_public'])}",
+         f"  by evidence: {r['via']}"]
+    for u in r['unresolved_public']:
+        L.append(f"  UNRESOLVED {u}")
+    for w in r['weak']:
+        L.append(f"  WEAK {w}")
+    return L
+
+
+
+def trace_data(target: str, probe: bool = True, pivot: Optional[bool] = None,
+               deep: bool = False, _depth: int = 0, _path: bool = True) -> dict:
+    """Structured reverse trace of one endpoint (IP or hostname)."""
+    d: dict = {'target': target, 'ip': '', 'error': '', 'scope': 'public', 'depth': _depth,
+               'time_utc': datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC'),
+               'rdns': '', 'fcrdns': '', 'local': [], 'registry': None, 'bgp': None, 'tor': None,
+               'exit_feed': None, 'provider_range': None, 'special': {}, 'tls': None, 'path': None,
+               'classification': {}, 'operator': None, 'verifier': None, 'lan': None,
+               'resolved': [], 'operator_side': None, 'active': None, 'unmask': None,
+               'disclose': None, 'canary': None, 'origin': None}
+    try:
+        ipaddress.ip_address(target)
+        d['ip'] = target
+    except ValueError:
+        addrs = sorted(_fwd_lookup_bounded(target, 5.0), key=lambda a: (':' in a, a))
+        if not addrs:
+            d['error'] = f"'{target}' is not a valid IP address or resolvable hostname"
+            return d
+        d['ip'], d['resolved'] = addrs[0], addrs[:8]
+    ip = d['ip']
+    d['rdns'] = _rdns_bounded(ip, 5.0)
+    d['special'] = special_range_info(ip)
+    if _depth == 0:
+        d['local'] = _trace_local_owners(ip)
+        try:
+            d['operator_side'] = _operator_side_trace(ip)
+        except Exception as exc:
+            _logger.debug("operator-side trace failed: %s", exc)
+    if not _is_public_ip_cached(ip):
+        d['scope'] = 'private'
+        if d['special'].get('embedded'):
+            d['embedded_trace'] = trace_data(d['special']['embedded'], probe=probe, pivot=pivot,
+                                             _depth=_depth + 1, _path=False)
+        elif d['special'].get('kind') == 'private':
+            d['lan'] = LanIdentity()
+            d['lan'].refresh()
+            d['lan'] = {**d['lan'].identify(ip), 'in_neighbour_table': ip in d['lan']._neigh}
+        if probe and _depth == 0:
+            d['active'] = _active_reverse_probe(ip, _trace_port(d), deep)
+            d['tls'] = tls_peer_subject(ip, _trace_port(d))
+            d['disclose'] = {'dns': _dns_identity_probes(ip), 'ntp': _ntp_probe(ip),
+                             'selfid': _selfname_battery(ip)}
+            if CONFIG.get('canary_port'):
+                d['canary'] = _canary_for_trace(ip)
+        if _depth == 0:
+            d['demask'] = _demask_for_trace(ip)
+            try:
+                d['guard_census'] = tor_guard_census()
+            except Exception:
+                d['guard_census'] = {}
+            d['sybil'] = sybil_census()
+            d['tor_relay_observe'] = _tor_relay_observe()
+            d['unmask'] = _trace_unmask(ip, d)
+        return d
+    from concurrent.futures import ThreadPoolExecutor
+    PROVIDER_RANGES.ensure(block=True)
+    _exit_feed_load_disk()
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        f_reg = ex.submit(lambda: WhoisLookup().lookup(ip))
+        f_bgp = ex.submit(cymru_asn_lookup, ip)
+        f_tor = ex.submit(_trace_tor, ip)
+        f_fc = ex.submit(lambda: _fwd_lookup_bounded(d['rdns'], 5.0) if d['rdns'] else set())
+        f_ripe = ex.submit(_trace_fetch, f'https://stat.ripe.net/data/prefix-overview/data.json?resource={ip}', 8.0)
+        d['registry'], d['bgp'], d['tor'] = f_reg.result(), f_bgp.result(), f_tor.result()
+        if (not d['registry'] or d['registry'].get('error')) and (d['bgp'] or {}).get('rir') in _RIR_RDAP:
+            w = WhoisLookup()
+            w._RDAP_URL = _RIR_RDAP[d['bgp']['rir']]
+            d['registry'] = w.lookup(ip) or d['registry']
+        fwd = f_fc.result()
+        ripe = ((f_ripe.result() or {}).get('data') or {})
+    if d['rdns']:
+        d['fcrdns'] = 'match' if ip in fwd else ('mismatch' if fwd else 'unresolvable')
+    if ripe.get('asns'):
+        a0 = ripe['asns'][0]
+        d['bgp'] = {**(d['bgp'] or {}), 'ripe_asn': f"AS{a0.get('asn')}", 'ripe_holder': a0.get('holder', ''),
+                    'announced': ripe.get('announced')}
+        if not (d['bgp'] or {}).get('asn'):
+            d['bgp']['asn'] = f"AS{a0.get('asn')}"
+            d['bgp']['name'] = a0.get('holder', '')
+            d['bgp']['prefix'] = ripe.get('resource', '')
+    d['provider_range'] = PROVIDER_RANGES.lookup(ip)
+    ent, apple = _exit_lookup(ip)
+    d['exit_feed'] = ent or apple
+    if probe:
+        d['tls'] = tls_peer_subject(ip)
+        if _path:
+            d['path'] = _trace_path(ip, (d.get('bgp') or {}).get('asn', ''))
+        if _depth == 0:
+            d['active'] = _active_reverse_probe(ip, _trace_port(d), deep)
+            d['disclose'] = {'dns': _dns_identity_probes(ip), 'ntp': _ntp_probe(ip),
+                             'page': _page_probe(ip, _trace_port(d)),
+                             'vhosts': _vhost_probe(ip), 'history': _trace_history(ip),
+                             'ct_names': _crtsh_names(_registrable_domain(d['rdns'])) if d['rdns'] else [],
+                             'vpn_gate': _vpn_gate_probe(ip),
+                'internetdb': _internetdb_probe(ip),
+                'neighbors': _neighbor_probe(ip),
+                             'selfid': _selfname_battery(ip)}
+            if CONFIG.get('canary_port'):
+                d['canary'] = _canary_for_trace(ip)
+                try:
+                    relay = _proxy_relay_probe(ip, _trace_port(d))
+                    if relay.get('relayed'):
+                        d['canary']['relay'] = relay
+                except Exception as exc:
+                    _logger.debug("proxy relay probe failed: %s", exc)
+    if deep and probe:
+        try:
+            mv = MultiVerifier(geoip=GeoIPCache(), location_verifier=LocationVerifier(ServiceResolver()),
+                               proxy_detector=ProxyDetector())
+            rep = mv.verify(ip, active=True)
+            d['verifier'] = {k: rep.get(k) for k in (
+                'grade', 'confidence', 'consensus_country', 'consensus_city', 'vpn_score', 'is_vpn',
+                'is_proxy', 'is_tor', 'is_hosting', 'is_cdn', 'labels', 'conflicts', 'summary')}
+            d['verifier']['methods'] = len(rep.get('methods', []))
+        except Exception as exc:
+            d['verifier'] = {'error': str(exc)[:160]}
+    d['classification'] = _trace_classify(d)
+    if _depth == 0 and set(d['classification'].get('kinds', [])) &             {'cdn', 'cloud', 'hosting', 'vpn', 'proxy'}:
+        try:
+            d['origin'] = _trace_origin_hunt(d, probe=probe)
+        except Exception as exc:
+            _logger.debug("origin hunt failed: %s", exc)
+    do_pivot = CONFIG.get('trace_operator_pivot', True) if pivot is None else pivot
+    if do_pivot and _depth == 0:
+        d['operator'] = _trace_operator_pivot(d, probe, _depth)
+    if _depth == 0:
+        # All four tiers run on every trace, always: Tier-1 (demask
+        # destination + canary), Tier-2 (flow correlation + operator
+        # records), Tier-3 (guard census + sybil position + local relay
+        # observation), Tier-4 (documented boundaries). Nothing is gated
+        # on classification — a non-Tor endpoint can still sit behind an
+        # observed relay or match an injected watermark.
+        d['demask'] = _demask_for_trace(ip)
+        try:
+            d['guard_census'] = tor_guard_census()
+        except Exception:
+            d['guard_census'] = {}
+        d['sybil'] = sybil_census()
+        d['tor_relay_observe'] = _tor_relay_observe()
+        d['unmask'] = _trace_unmask(ip, d)
+    d['evidence'] = _trace_evidence(d)
+    return d
+
+
+def _trace_limit_note(cls: dict) -> list:
+    k = set(cls.get('kinds', []))
+    if k & {'tor-exit', 'tor-relay'}:
+        why = ("Tor: traffic is onion-routed through three relays; the exit/relay seen here never "
+               "learns the client, and no public record maps a circuit to a person.")
+    elif 'vpn' in k:
+        why = ("VPN: the provider's connection logs (if any exist) are the only record linking this "
+               "exit address to a subscriber.")
+    elif k & {'cdn', 'cloud', 'hosting'}:
+        why = ("Shared infrastructure: many tenants share this address; the tenant behind it is "
+               "known only to the operator.")
+    elif k & {'isp', 'cgn'}:
+        why = "Access network: the subscriber behind this address is known only to the ISP."
+    else:
+        why = "The party behind this address is known only to the registered operator."
+    return [why,
+            "Trace therefore continues AT THE OPERATOR (section above): identity, contacts, footprint.",
+            "Beyond that point the record is held by the operator and is obtainable only through its",
+            "abuse/legal channel or lawful process — it is not derivable from the wire, and this",
+            "tool does not attempt to de-anonymise clients."]
+
+
+def _render_trace(d: dict, ind: str = '') -> list:
+    L: list = []
+    ip = d['ip']
+    L.append(f"{ind}ATTRIBUTION REPORT  {ip}" + (f"   (resolved from {d['target']})" if d.get('target') != ip else ''))
+    L.append(ind + "=" * 60)
+    L.append(f"{ind}Reverse DNS : {d['rdns'] or '(none published)'}"
+             + (f"   [forward-confirmed: {d['fcrdns']}]" if d.get('fcrdns') else ''))
+    if d.get('resolved') and len(d['resolved']) > 1:
+        L.append(f"{ind}All A/AAAA  : {', '.join(d['resolved'])}")
+    for lo in d.get('local', []):
+        L.append(f"{ind}Local owner : {lo['process'] or '(owner not visible)'} PID {lo['pid']}  "
+                 f"{lo['proto']} {lo['local']} -> :{lo['remote_port']} [{lo['status']}]"
+                 + (f"  exe={lo['exe']}" if lo['exe'] else ''))
+    if d['scope'] != 'public':
+        sp = d.get('special') or {}
+        L.append(f"{ind}Scope       : private/reserved address - local network, no registry data"
+                 + (f"  [{sp['label']}]" if sp.get('label') else ''))
+        lan = d.get('lan')
+        if lan:
+            L.append(f"{ind}LAN device  : MAC {lan['mac'] or '(not in neighbour table)'}"
+                     + (f"  vendor {lan['vendor']}" if lan['vendor'] else '')
+                     + ("  randomised/private MAC" if lan['randomized_mac'] else '')
+                     + ("  <- default gateway" if lan['gateway'] else ''))
+        if sp.get('embedded'):
+            L.append(f"{ind}Embedded IPv4: {sp['embedded']}  (address self-unmasks the tunnelled endpoint)")
+            et = d.get('embedded_trace')
+            if et and not et.get('error'):
+                L += _render_trace(et, ind + '    ')
+        cert = d.get('tls')
+        if cert is not None:
+            if cert.get('ok'):
+                subj = cert.get('subject', {})
+                L.append(f"{ind}TLS cert    : CN={subj.get('commonName', '?')} "
+                         f"O={subj.get('organizationName', '?')} trusted={cert.get('trusted')}"
+                         + (f"  SANs={', '.join(cert.get('san', [])[:5])}" if cert.get('san') else ''))
+            else:
+                L.append(f"{ind}TLS cert    : none ({cert.get('error', 'no TLS')[:60]})")
+        if d.get('active'):
+            L += _render_active_probe(d['active'], ind)
+        if d.get('disclose'):
+            L += _render_disclosure(d['disclose'], ind)
+        if d.get('operator_side'):
+            L += _render_operator_side(d['operator_side'], ind)
+        if d.get('canary'):
+            L.append(f"{ind}Canary URL  : {d['canary']['url']}  ({d['canary']['note']})")
+        return L
+    who = d.get('registry') or {}
+    if not who or who.get('error'):
+        L.append(f"{ind}RDAP        : lookup failed (network or rate limit)")
+    else:
+        L.append(f"{ind}Network     : {who.get('name')}  [{who.get('handle')}]  country={who.get('country')}")
+        L.append(f"{ind}Range       : {who.get('start_address')} - {who.get('end_address')}"
+                 + (f"  ({', '.join(who['cidr'])})" if who.get('cidr') else ''))
+        for e in who.get('entities', []):
+            if e.get('name'):
+                L.append(f"{ind}Entity      : {e['name']}  roles={','.join(e.get('roles', []))}")
+        for c in who.get('contacts', [])[:4]:
+            bits = [x for x in (', '.join(c.get('emails', [])), ', '.join(c.get('phones', [])), c.get('address', '')) if x]
+            if bits:
+                L.append(f"{ind}Contact     : {c.get('name') or c.get('handle')}  ({','.join(c.get('roles', []))})  " + ' | '.join(bits))
+        L.append(f"{ind}Abuse contact: {', '.join(who.get('abuse', [])) or '(not published)'}")
+        reg = (who.get('events') or {}).get('registration')
+        if reg:
+            L.append(f"{ind}Registered  : {reg}")
+        for rm in who.get('remarks', [])[:2]:
+            if rm:
+                L.append(f"{ind}Remark      : {rm}")
+        low = ' '.join([str(who.get('name', ''))] + [e.get('name', '') for e in who.get('entities', [])]).lower()
+        cat = next((c for keys, c in ConnectionInventory._ORG_CATEGORY_HINTS
+                    if any(k in low for k in keys)), 'Network Operator')
+        L.append(f"{ind}Operator type: {cat}")
+        if cat in ('CDN', 'Cloud/Hosting'):
+            L.append(ind + "NOTE        : shared infrastructure - many tenants share this address; "
+                           "the operator, not an individual, is the attributable party.")
+    bg = d.get('bgp') or {}
+    if bg.get('asn'):
+        L.append(f"{ind}BGP origin  : {bg['asn']} {bg.get('name', '')}  prefix {bg.get('prefix', '?')}  "
+                 f"{bg.get('cc', '')} {bg.get('rir', '')} allocated {bg.get('allocated', '?')}"
+                 + (f"  (also announced by {', '.join(bg['asns'][1:])})" if len(bg.get('asns', [])) > 1 else ''))
+    if d.get('provider_range'):
+        pr = d['provider_range']
+        L.append(f"{ind}Published   : {pr['label']}  (operator's own published ranges)")
+    if d.get('exit_feed'):
+        ex = d['exit_feed']
+        L.append(f"{ind}Exit feed   : {ex.get('provider')} {ex.get('kind', '')} {ex.get('host', '')} "
+                 f"{ex.get('city', '')} {ex.get('cc', '')}".rstrip())
+    tor = d.get('tor')
+    if tor:
+        L.append(f"{ind}Tor relay   : '{tor['nickname']}' fp={tor['fingerprint'][:16]} flags={','.join(tor['flags'])} "
+                 f"{tor['country']} {tor['as']} {tor['as_name']}")
+        L.append(f"{ind}Tor operator: contact={tor['contact'] or '(none published)'}  "
+                 f"family={tor['family_size']} relay(s)  first seen {tor['first_seen']}")
+    cert = d.get('tls')
+    if cert is not None:
+        if cert.get('ok'):
+            subj = cert.get('subject', {})
+            L.append(f"{ind}TLS cert    : CN={subj.get('commonName', '?')} O={subj.get('organizationName', '?')} "
+                     f"trusted={cert.get('trusted')}  SANs={', '.join(cert.get('san', [])[:5]) or '-'}")
+        else:
+            L.append(f"{ind}TLS cert    : none ({cert.get('error', 'no TLS on 443')})")
+    path = d.get('path')
+    if path and path['hops']:
+        L.append(f"{ind}Path        :" + (f"   AS path: {' > '.join(path['asn_path'])}" if path['asn_path'] else ''))
+        for h in path['hops']:
+            tag = ' <== enters operator AS' if h['hop'] == path['border_hop'] else ''
+            L.append(f"{ind}  {h['hop']:>2}  {h['ip'] or '*':<16} {h['asn']:<9} {h['rdns'] or h['name']}"
+                     + (f"  [~{h['hint']}?]" if h['hint'] else '') + tag)
+        if not path['reached']:
+            L.append(ind + "      (target did not answer the final hop - filtered; path ends at the last responder)")
+    v = d.get('verifier')
+    if v:
+        if v.get('error'):
+            L.append(f"{ind}Verifier    : unavailable ({v['error']})")
+        else:
+            L.append(f"{ind}Verifier    : {v['methods']} methods  grade={v['grade']} country={v['consensus_country']} "
+                     f"vpn_score={v['vpn_score']} vpn={v['is_vpn']} proxy={v['is_proxy']} tor={v['is_tor']} "
+                     f"hosting={v['is_hosting']} cdn={v['is_cdn']}")
+            for lb in (v.get('labels') or [])[:6]:
+                L.append(f"{ind}  - {lb}")
+    cls = d.get('classification') or {}
+    if cls.get('labels'):
+        L.append(f"{ind}Classified  : {', '.join(cls['kinds'])}  -  {'; '.join(cls['labels'][:4])}")
+    op = d.get('operator')
+    if op:
+        L.append(ind + "-" * 60)
+        L.append(ind + "OPERATOR PIVOT - trace continued at the operator")
+        L.append(f"{ind}Operator names  : {', '.join(op['names']) or '(none)'}")
+        L.append(f"{ind}Operator domains: {', '.join(op['domains']) or '(none discovered)'}"
+                 + (f"   (rejected, not hosted by the operator: {', '.join(op['dropped_uncorroborated'])})"
+                    if op.get('dropped_uncorroborated') else ''))
+        fp = op.get('footprint') or {}
+        if fp.get('prefix_count'):
+            L.append(f"{ind}Footprint       : {fp['prefix_count']} announced prefix(es), e.g. {', '.join(fp['prefix_sample'][:5])}")
+        if fp.get('neighbours'):
+            L.append(f"{ind}BGP neighbours  : {fp['neighbours']}  top: {', '.join(fp.get('neighbour_top', []))}")
+        for p in op.get('profiles', []):
+            L.append(f"{ind}Domain {p['domain']}: hosted at "
+                     + ', '.join(f"{h['ip']} {h['asn']} {h['name']}" for h in p['hosted_at'])
+                     + (f"; registrar {p['registrar']}" if p['registrar'] else '')
+                     + (f"; created {p['created']}" if p['created'] else ''))
+            st = p.get('security_txt') or {}
+            if st:
+                L.append(f"{ind}  security.txt ({p.get('security_txt_url')}): contact={'; '.join(st.get('contact', [])[:3])}"
+                         + (f" policy={st['policy'][0]}" if st.get('policy') else ''))
+        if op.get('tor_family'):
+            fam = op['tor_family']
+            L.append(f"{ind}Tor family     : {len(fam)} relay(s) run by the same operator: "
+                     + ', '.join(x['nickname'] for x in fam[:12]) + (' ...' if len(fam) > 12 else ''))
+        ot = op.get('operator_trace')
+        if ot and not ot.get('error'):
+            L.append(f"{ind}Operator infrastructure traced ({op.get('operator_trace_via')} -> {ot['ip']}):")
+            L += _render_trace(ot, ind + '    ')
+    if d.get('active') and d['depth'] == 0:
+        L += _render_active_probe(d['active'], ind)
+    if d.get('disclose') and d['depth'] == 0:
+        L += _render_disclosure(d['disclose'], ind)
+    if d.get('origin') and d['depth'] == 0:
+        L += _render_origin(d['origin'], ind)
+    if d.get('operator_side') and d['depth'] == 0:
+        L += _render_operator_side(d['operator_side'], ind)
+    if d.get('canary') and d['depth'] == 0:
+        L.append(f"{ind}Canary URL  : {d['canary']['url']}")
+
+        if d.get('demask'):
+            dm = d['demask']
+            L.append(f"{ind}De-mask page  : {dm['url']}   <- serve this to the client;")
+            L.append(f"{ind}                its browser runs WebRTC + fingerprint, leaks report back")
+            L.append(f"{ind}Session pixel : {dm['pixel_url']}   (ETag+cookie link across egresses)")
+            for h in dm.get('hits', [])[-4:]:
+                leak = ('  LEAKED ' + ', '.join(l['addr'] for l in h.get('leaked', []))) if h.get('leaked') else ''
+                L.append(f"{ind}  hit: {h['ip']}:{h.get('port',0)} {h['time']}{leak}")
+            for h in (dm.get('dns_leaks') or [])[-4:]:
+                L.append(f"{ind}  dns-leak: resolver {h['resolver']} asked for {h['qname']}"
+                         + (f" ecs={h['ecs']}" if h.get('ecs') else ''))
+            L.append(f"{ind}  ({d['canary']['note']})")
+        rel = (d['canary'].get('relay') or {})
+        if rel.get('relayed'):
+            for r in rel['relayed']:
+                L.append(f"{ind}  OPEN RELAY  :{r['port']} accepted a {r['proto']} forward — "
+                         f"watch canary hits for this relay's upstream egress")
+    if d.get('evidence') and d['depth'] == 0:
+        L.append(ind + "-" * 60)
+        L.append(ind + "EVIDENCE PACKET (for an abuse report or lawful request to the operator)")
+        L += [ind + '  ' + x for x in d['evidence']]
+    um = d.get('unmask')
+    if um and d['depth'] == 0:
+        L.append(ind + "-" * 60)
+        L.append(ind + "CLIENT DE-MASKING — every channel that can still name the party behind")
+        L.append(ind + "this endpoint, checked live:")
+        for o in um.get('origins', []):
+            bits = f"{o['ip']}  via {o['via']}"
+            tail = ' — '.join(x for x in (o.get('rdns'), o.get('as_name'),
+                                          o.get('asn')) if x)
+            if not o.get('public'):
+                tail = (tail + '  ' if tail else '') + '(pre-NAT/private address)'
+            L.append(f"{ind}  ORIGIN  {bits}" + (f"   -> {tail}" if tail else ''))
+        for a in um.get('aliases', []):
+            tail = ' — '.join(x for x in (a.get('rdns'), a.get('as_name'),
+                                          a.get('asn')) if x)
+            L.append(f"{ind}  LINKED  {a['ip']}  {a['how']}"
+                     + (f"   -> {tail}" if tail else ''))
+        for t in um.get('tokens', []):
+            L.append(f"{ind}  TOKEN   {t}")
+        for c in um.get('channels', []):
+            mark = '+' if c['result'] == 'REVEALED' else ' '
+            L.append(f"{ind}  [{mark}] {c['name']:<45} {c['result']}")
+        if um.get('origins') or um.get('aliases'):
+            L.append(ind + "  -> run --trace on any disclosed/linked address to carry the")
+            L.append(ind + "     attribution one hop closer to the origin.")
+        L.append(f"{ind}  Record holder: {um.get('holder') or 'the registered operator'} —"
+                 " the subscriber/session record beyond this point exists only in that")
+        L.append(ind + "  operator's logs; the evidence packet above is the lawful route to it.")
+        L.append(ind + "  Limits: the channel list above is exhaustive — a channel that shows")
+        L.append(ind + "  no disclosure is a measured boundary, not an unchecked assumption.")
+        L.append(ind + "  Limits: every de-masking channel above has been checked; what remains")
+        L.append(ind + "  is operator-held and reachable only through that operator.")
+        for ln in _trace_limit_note(cls):
+            L.append(ind + "  > " + ln)
+    elif d['depth'] == 0:
+        L.append(ind + "-" * 60)
+        L.append(ind + "Limits: attribution stops at the registered operator.")
+        for ln in _trace_limit_note(cls):
+            L.append(ind + "  > " + ln)
+    return L
+
+
+def trace_report(ip: str, probe: bool = True, pivot: Optional[bool] = None, deep: bool = False) -> str:
+    """Attribution report for one remote address or hostname: who operates it,
+    how to reach them, what it presents, the network path — and, for
+    VPN/proxy/Tor/CDN/cloud endpoints, the same trace carried on to the
+    operator. Limits are printed with every report: client identity behind
+    such a service exists only in the operator's records."""
+    d = trace_data(ip, probe=probe, pivot=pivot, deep=deep)
+    if d['error']:
+        return d['error']
+    return "\n".join(_render_trace(d))
 
 
 # ========================== ALERT ESCALATION ==========================
@@ -21228,6 +27178,40 @@ class DatabaseManager:
                 key TEXT PRIMARY KEY, mac TEXT, ip TEXT, vendor TEXT,
                 hostname TEXT, os_guess TEXT, first_seen TEXT,
                 last_seen TEXT, confidence REAL)""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS connections (
+                key TEXT PRIMARY KEY, process TEXT, pid INTEGER, exe_path TEXT,
+                remote_ip TEXT, remote_port INTEGER, protocol TEXT,
+                service TEXT, category TEXT, domain TEXT, via TEXT,
+                org TEXT, asn TEXT, country TEXT, city TEXT, rdns TEXT,
+                is_vpn INTEGER, is_proxy INTEGER, is_tor INTEGER,
+                verify_grade TEXT, first_seen REAL, last_seen REAL)""")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_conn_ip ON connections(remote_ip)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_conn_proc ON connections(process)")
+            conn.execute("""CREATE TABLE IF NOT EXISTS conn_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL, remote_ip TEXT, remote_port INTEGER,
+                protocol TEXT, process TEXT, pid INTEGER,
+                service TEXT, domain TEXT, via TEXT, org TEXT,
+                asn TEXT, country TEXT, city TEXT,
+                is_vpn INTEGER, is_tor INTEGER, verify_grade TEXT)""")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_hist_ip ON conn_history(remote_ip)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_hist_ts ON conn_history(ts)")
+            conn.execute("""CREATE TABLE IF NOT EXISTS monitor_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL, category TEXT, severity TEXT,
+                process TEXT, pid INTEGER, description TEXT,
+                details TEXT)""")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_monev_ts ON monitor_events(ts)")
+            conn.execute("""CREATE TABLE IF NOT EXISTS emitters (
+                key TEXT PRIMARY KEY, medium TEXT, address TEXT,
+                name TEXT, rssi_dbm REAL, freq_mhz REAL, sensor TEXT,
+                status TEXT, first_seen REAL, last_seen REAL,
+                seen_count INTEGER, geo_fix TEXT, extra TEXT)""")
+            conn.execute("""CREATE TABLE IF NOT EXISTS rf_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL, type TEXT, severity TEXT, detail TEXT,
+                extra TEXT)""")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_rfev_ts ON rf_events(ts)")
             conn.commit()
             conn.close()
         except Exception as exc:
@@ -21240,6 +27224,89 @@ class DatabaseManager:
                 "hostname, os_guess, first_seen, last_seen, confidence) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
 
+    _CONN_SQL = ("INSERT OR REPLACE INTO connections (key, process, pid, exe_path, "
+                 "remote_ip, remote_port, protocol, service, category, domain, via, "
+                 "org, asn, country, city, rdns, is_vpn, is_proxy, is_tor, "
+                 "verify_grade, first_seen, last_seen) "
+                 "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+
+    _HIST_SQL = ("INSERT INTO conn_history (ts, remote_ip, remote_port, "
+                 "protocol, process, pid, service, domain, via, org, asn, "
+                 "country, city, is_vpn, is_tor, verify_grade) "
+                 "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+    _MON_SQL = ("INSERT INTO monitor_events (ts, category, severity, "
+                "process, pid, description, details) VALUES (?,?,?,?,?,?,?)")
+    _EMIT_SQL = ("INSERT OR REPLACE INTO emitters (key, medium, address, "
+                 "name, rssi_dbm, freq_mhz, sensor, status, first_seen, "
+                 "last_seen, seen_count, geo_fix, extra) "
+                 "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)")
+    _RFEV_SQL = ("INSERT INTO rf_events (ts, type, severity, detail, extra) "
+                 "VALUES (?,?,?,?,?)")
+
+    def save_connections(self, rows: list):
+        """Queue a snapshot of connection dicts (ConnectionEntry.to_dict())."""
+        for r in rows:
+            try:
+                key = f"{r['remote_ip']}|{r['remote_port']}|{r['pid']}|{r['protocol']}|{int(r['first_seen'])}"
+                self._q.put_nowait(('c', (
+                    key, r.get('process'), r.get('pid'), r.get('exe_path'),
+                    r.get('remote_ip'), r.get('remote_port'), r.get('protocol'),
+                    r.get('service'), r.get('category'), r.get('domain'), r.get('via'),
+                    r.get('org'), r.get('asn'), r.get('country'), r.get('city'), r.get('rdns'),
+                    int(bool(r.get('is_vpn'))), int(bool(r.get('is_proxy'))),
+                    int(bool(r.get('is_tor'))), r.get('verify_grade'),
+                    r.get('first_seen'), r.get('last_seen'))))
+            except queue.Full:
+                return
+            except Exception:
+                continue
+            try:
+                self._q.put_nowait(('h', (
+                    time.time(), r.get('remote_ip'), r.get('remote_port'),
+                    r.get('protocol'), r.get('process'), r.get('pid'),
+                    r.get('service'), r.get('domain'), r.get('via'),
+                    r.get('org'), r.get('asn'), r.get('country'),
+                    r.get('city'), int(bool(r.get('is_vpn'))),
+                    int(bool(r.get('is_tor'))), r.get('verify_grade'))))
+            except (queue.Full, Exception):
+                pass
+
+    def save_monitor_event(self, ev: dict):
+        """Queue a suspicious-events entry (the deque drops them past
+        capacity — the table keeps full history)."""
+        try:
+            self._q.put_nowait(('m', (
+                ev.get('timestamp') or ev.get('ts') or time.time(),
+                ev.get('category'), ev.get('severity'),
+                ev.get('process'), ev.get('pid'),
+                ev.get('description'),
+                json.dumps(ev.get('details'), default=str))))
+        except (queue.Full, Exception):
+            pass
+
+    def save_emitters(self, emitters: list):
+        """Queue an emitter-registry snapshot (latest-state upsert)."""
+        for em in emitters:
+            try:
+                self._q.put_nowait(('e', (
+                    em.get('key'), em.get('medium'), em.get('address'),
+                    em.get('name'), em.get('rssi_dbm'), em.get('freq_mhz'),
+                    em.get('sensor'), em.get('status'),
+                    em.get('first_seen'), em.get('last_seen'),
+                    em.get('seen_count'), json.dumps(em.get('geo_fix'), default=str),
+                    json.dumps(em.get('extra'), default=str))))
+            except (queue.Full, Exception):
+                continue
+
+    def save_rf_event(self, ev: dict):
+        try:
+            self._q.put_nowait(('r', (
+                ev.get('time') or time.time(), ev.get('type'),
+                ev.get('severity'), ev.get('detail'),
+                json.dumps(ev, default=str))))
+        except (queue.Full, Exception):
+            pass
+
     def _writer_loop(self):
         conn = None
         try:
@@ -21249,22 +27316,27 @@ class DatabaseManager:
                     item = self._q.get(timeout=0.5)
                 except queue.Empty:
                     continue
-                batch_ded, batch_dev = [], []
+                batches = {'d': [], 'v': [], 'c': [],
+                           'h': [], 'm': [], 'e': [], 'r': []}
+                n = 0
                 while item is not None:
                     kind, row = item
-                    (batch_ded if kind == 'd' else batch_dev).append(row)
+                    batches[kind].append(row)
+                    n += 1
                     try:
                         item = self._q.get_nowait()
                     except queue.Empty:
                         item = None
-                    if len(batch_ded) + len(batch_dev) >= 200:
+                    if n >= 500:
                         item = None
                 try:
-                    if batch_ded:
-                        conn.executemany(self._DED_SQL, batch_ded)
-                    if batch_dev:
-                        conn.executemany(self._DEV_SQL, batch_dev)
-                    if batch_ded or batch_dev:
+                    for kind, sql in (('d', self._DED_SQL), ('v', self._DEV_SQL),
+                                      ('c', self._CONN_SQL), ('h', self._HIST_SQL),
+                                      ('m', self._MON_SQL), ('e', self._EMIT_SQL),
+                                      ('r', self._RFEV_SQL)):
+                        if batches[kind]:
+                            conn.executemany(sql, batches[kind])
+                    if n:
                         conn.commit()
                 except Exception as exc:
                     _logger.debug("DB batch write failed: %s", exc)
@@ -21724,10 +27796,11 @@ class ConnectionEntry:
         'proxy_type', 'rdns', 'region', 'remote_ip', 'remote_port', 'rtt_ms',
         'service', 'status', 'timezone', 'ttl_os', 'verify_conflicts',
         'verify_grade', 'verify_summary', 'via', 'vpn_labels', 'vpn_provider',
-        'vpn_score', 'website_tag',
+        'vpn_score', 'website_tag', 'owner_via',
     )
 
     def __init__(self):
+        self.owner_via = ''
         self.pid = 0
         self.process_name = ''
         self.exe_path = ''
@@ -21816,7 +27889,248 @@ class ConnectionEntry:
             'verify_conflicts': self.verify_conflicts,
             'rtt_ms': self.rtt_ms, 'ttl_os': self.ttl_os,
             'hop_distance': self.hop_distance, 'open_ports': self.open_ports,
+            'owner_via': self.owner_via,
         }
+
+
+# ===================== GUARANTEED MAP PINPOINT =====================
+# Every connection gets a pin. Precision is graded and honest: GeoIP API
+# coords are city-grade; when they are absent the pin falls back to the
+# registry country centroid (cymru/RDAP country), then — for LAN scopes —
+# to a deterministic jitter around the host's own position, and finally to
+# a labeled marker point in the South Atlantic so nothing is invisible.
+# geo_source records which tier produced the pin.
+
+_COUNTRY_CENTROIDS = {
+    'AD': (42.5, 1.6), 'AE': (23.4, 53.8), 'AF': (33.9, 67.7),
+    'AG': (17.1, -61.8), 'AI': (18.2, -63.1), 'AL': (41.2, 20.2),
+    'AM': (40.1, 45.0), 'AO': (-11.2, 17.9), 'AQ': (-75.3, 0.0),
+    'AR': (-38.4, -63.6), 'AS': (-14.3, -170.7), 'AT': (47.5, 14.6),
+    'AU': (-25.3, 133.8), 'AW': (12.5, -69.9), 'AX': (60.2, 20.2),
+    'AZ': (40.1, 47.6), 'BA': (43.9, 17.7), 'BB': (13.2, -59.5),
+    'BD': (23.7, 90.4), 'BE': (50.5, 4.5), 'BF': (12.2, -1.6),
+    'BG': (42.7, 25.5), 'BH': (26.1, 50.6), 'BI': (-3.4, 29.9),
+    'BJ': (9.3, 2.3), 'BL': (17.9, -62.8), 'BM': (32.3, -64.8),
+    'BN': (4.5, 114.7), 'BO': (-16.3, -63.6), 'BQ': (12.2, -68.3),
+    'BR': (-14.2, -51.9), 'BS': (25.0, -77.4), 'BT': (27.5, 90.4),
+    'BV': (-54.4, 3.4), 'BW': (-22.3, 24.7), 'BY': (53.7, 27.9),
+    'BZ': (17.2, -88.5), 'CA': (56.1, -106.3), 'CC': (-12.2, 96.8),
+    'CD': (-4.0, 21.8), 'CF': (6.6, 20.9), 'CG': (-0.2, 15.8),
+    'CH': (46.8, 8.2), 'CI': (7.5, -5.5), 'CK': (-21.2, -159.8),
+    'CL': (-35.7, -71.5), 'CM': (7.4, 12.4), 'CN': (35.9, 104.2),
+    'CO': (4.6, -74.3), 'CR': (9.7, -83.8), 'CU': (21.5, -77.8),
+    'CV': (16.0, -24.0), 'CW': (12.2, -69.0), 'CX': (-10.5, 105.7),
+    'CY': (35.1, 33.4), 'CZ': (49.8, 15.5), 'DE': (51.2, 10.5),
+    'DJ': (11.8, 42.6), 'DK': (56.3, 9.5), 'DM': (15.4, -61.4),
+    'DO': (18.7, -70.2), 'DZ': (28.0, 1.7), 'EC': (-1.8, -78.2),
+    'EE': (58.6, 25.0), 'EG': (26.8, 30.8), 'EH': (24.2, -13.0),
+    'ER': (15.2, 39.8), 'ES': (40.5, -3.7), 'ET': (9.1, 40.5),
+    'FI': (61.9, 25.7), 'FJ': (-17.7, 178.1), 'FK': (-51.8, -59.5),
+    'FM': (7.4, 150.6), 'FO': (61.9, -6.9), 'FR': (46.2, 2.2),
+    'GA': (-0.8, 11.6), 'GB': (55.4, -3.4), 'GD': (12.1, -61.7),
+    'GE': (42.3, 43.4), 'GF': (3.9, -53.1), 'GG': (49.5, -2.6),
+    'GH': (7.9, -1.0), 'GI': (36.1, -5.4), 'GL': (71.7, -42.6),
+    'GM': (13.4, -15.3), 'GN': (9.9, -9.7), 'GP': (16.3, -61.6),
+    'GQ': (1.7, 10.3), 'GR': (39.1, 21.8), 'GS': (-54.4, -36.6),
+    'GT': (15.8, -90.2), 'GU': (13.4, 144.8), 'GW': (11.8, -15.2),
+    'GY': (4.9, -58.9), 'HK': (22.4, 114.1), 'HM': (-53.1, 73.5),
+    'HN': (15.2, -86.2), 'HR': (45.1, 15.2), 'HT': (18.9, -72.3),
+    'HU': (47.2, 19.5), 'ID': (-0.8, 113.9), 'IE': (53.4, -8.2),
+    'IL': (31.0, 34.9), 'IM': (54.2, -4.5), 'IN': (21.0, 78.0),
+    'IO': (-6.3, 71.9), 'IQ': (33.2, 43.7), 'IR': (32.4, 53.7),
+    'IS': (64.9, -19.0), 'IT': (41.9, 12.6), 'JE': (49.2, -2.1),
+    'JM': (18.1, -77.3), 'JO': (30.6, 36.2), 'JP': (36.2, 138.3),
+    'KE': (-0.0, 37.9), 'KG': (41.2, 74.8), 'KH': (12.6, 105.0),
+    'KI': (-3.4, -168.7), 'KM': (-11.9, 43.9), 'KN': (17.4, -62.8),
+    'KP': (40.3, 127.5), 'KR': (35.9, 127.8), 'KW': (29.3, 47.5),
+    'KY': (19.5, -80.6), 'KZ': (48.0, 66.9), 'LA': (19.9, 102.5),
+    'LB': (33.9, 35.9), 'LC': (13.9, -61.0), 'LI': (47.2, 9.6),
+    'LK': (7.9, 80.8), 'LR': (6.4, -9.4), 'LS': (-29.6, 28.2),
+    'LT': (55.2, 23.9), 'LU': (49.8, 6.1), 'LV': (56.9, 24.6),
+    'LY': (26.3, 17.2), 'MA': (31.8, -7.1), 'MC': (43.7, 7.4),
+    'MD': (47.4, 28.4), 'ME': (42.7, 19.4), 'MF': (18.1, -63.1),
+    'MG': (-18.8, 46.9), 'MH': (7.1, 171.2), 'MK': (41.6, 21.7),
+    'ML': (17.6, -4.0), 'MM': (21.9, 96.0), 'MN': (46.9, 103.8),
+    'MO': (22.2, 113.5), 'MP': (17.3, 145.4), 'MQ': (14.6, -61.0),
+    'MR': (21.0, -10.9), 'MS': (16.7, -62.2), 'MT': (35.9, 14.4),
+    'MU': (-20.3, 57.6), 'MV': (3.2, 73.2), 'MW': (-13.3, 34.3),
+    'MX': (23.6, -102.6), 'MY': (4.2, 101.9), 'MZ': (-18.7, 35.5),
+    'NA': (-22.9, 18.5), 'NC': (-20.9, 165.6), 'NE': (17.6, 8.1),
+    'NF': (-29.0, 168.0), 'NG': (9.1, 8.7), 'NI': (12.9, -85.2),
+    'NL': (52.1, 5.3), 'NO': (60.5, 8.5), 'NP': (28.4, 84.1),
+    'NR': (-0.5, 166.9), 'NU': (-19.1, -169.9), 'NZ': (-40.9, 174.9),
+    'OM': (21.5, 55.9), 'PA': (8.5, -80.8), 'PE': (-9.2, -75.0),
+    'PF': (-17.7, -149.4), 'PG': (-6.3, 147.0), 'PH': (12.9, 121.8),
+    'PK': (30.4, 69.3), 'PL': (51.9, 19.1), 'PM': (46.9, -56.3),
+    'PN': (-24.4, -128.3), 'PR': (18.2, -66.6), 'PS': (31.9, 35.2),
+    'PT': (39.4, -8.2), 'PW': (7.5, 134.6), 'PY': (-23.4, -58.4),
+    'QA': (25.4, 51.2), 'RE': (-21.1, 55.5), 'RO': (45.9, 25.0),
+    'RS': (44.0, 21.0), 'RU': (61.5, 105.3), 'RW': (-1.9, 29.9),
+    'SA': (23.9, 45.1), 'SB': (-9.6, 160.2), 'SC': (-4.7, 55.5),
+    'SD': (12.9, 30.2), 'SE': (60.1, 18.6), 'SG': (1.4, 103.8),
+    'SH': (-24.1, -10.0), 'SI': (46.2, 14.9), 'SJ': (77.9, 22.3),
+    'SK': (48.7, 19.7), 'SL': (8.5, -11.8), 'SM': (43.9, 12.5),
+    'SN': (14.5, -14.5), 'SO': (5.2, 46.2), 'SR': (3.9, -56.0),
+    'SS': (6.9, 31.3), 'ST': (0.2, 6.6), 'SV': (13.8, -88.9),
+    'SX': (18.0, -63.1), 'SY': (35.0, 38.0), 'SZ': (-26.5, 31.5),
+    'TC': (21.7, -71.8), 'TD': (15.5, 18.7), 'TF': (-49.3, 70.2),
+    'TG': (8.6, 0.8), 'TH': (15.9, 101.0), 'TJ': (38.9, 71.3),
+    'TK': (-8.9, -171.9), 'TL': (-8.9, 125.7), 'TM': (38.9, 59.6),
+    'TN': (33.9, 9.5), 'TO': (-21.2, -175.2), 'TR': (38.9, 35.2),
+    'TT': (10.7, -61.2), 'TV': (-7.1, 177.6), 'TW': (23.7, 121.0),
+    'TZ': (-6.4, 34.9), 'UA': (48.4, 31.2), 'UG': (1.4, 32.4),
+    'UM': (19.3, 166.6), 'US': (37.1, -95.8), 'UY': (-32.5, -55.8),
+    'UZ': (41.4, 64.6), 'VA': (41.9, 12.5), 'VC': (12.9, -61.3),
+    'VE': (6.4, -66.6), 'VG': (18.4, -64.6), 'VI': (18.3, -64.9),
+    'VN': (14.1, 108.3), 'VU': (-15.4, 166.9), 'WF': (-13.8, -177.2),
+    'WS': (-13.8, -172.1), 'YE': (15.6, 48.5), 'YT': (-12.8, 45.2),
+    'ZA': (-30.6, 22.9), 'ZM': (-13.1, 27.8), 'ZW': (-19.0, 29.2),
+}
+# Marker point for truly unattributed addresses — labeled, never mistaken
+# for a real fix: mid South Atlantic, far from any landmass.
+_UNATTRIBUTED_PIN = (-33.0, -20.0)
+
+
+def _pinpoint_coords(entry, host_pos=None) -> None:
+    """Guarantee entry.lat/lon so every connection lands on the map.
+    Precision tiers (recorded in geo_source):
+      api coords already set            -> untouched
+      known country (geo/cymru/RDAP)    -> registry country centroid
+      LAN/private/loopback scope        -> jittered ring around host_pos
+      still nothing                     -> _UNATTRIBUTED_PIN (labeled)
+    """
+    if entry.lat or entry.lon:
+        return
+    cc = (entry.country_code or '').strip().upper()
+    if cc in _COUNTRY_CENTROIDS:
+        entry.lat, entry.lon = _COUNTRY_CENTROIDS[cc]
+        entry.geo_source = (entry.geo_source or '') + '+cc-centroid'
+        if entry.city in ('', '??'):
+            entry.city = f'{cc} (country-level)'
+        return
+    kind = ''
+    try:
+        kind = (special_range_info(entry.remote_ip) or {}).get('kind', '')
+    except Exception:
+        pass
+    if kind in ('private', 'linklocal', 'cgn', 'loopback') and host_pos:
+        lat, lon = host_pos
+        if isinstance(lat, (int, float)) and lat:
+            # deterministic ring by the last two octets — LAN devices
+            # cluster beside the host pin, distinct from each other
+            parts = entry.remote_ip.split('.')
+            try:
+                h = int(parts[-2]) * 251 + int(parts[-1])
+            except (IndexError, ValueError):
+                h = sum(bytearray(entry.remote_ip.encode()))
+            ang = (h % 360) * math.pi / 180.0
+            rad = 0.03 + (h % 7) * 0.008   # ~3-8 km ring
+            entry.lat = round(lat + rad * math.cos(ang), 5)
+            entry.lon = round(lon + rad * math.sin(ang) /
+                              max(0.3, math.cos(math.radians(lat))), 5)
+            entry.geo_source = (entry.geo_source or '') + '+lan-ring'
+            if entry.city in ('', '??'):
+                entry.city = 'local network'
+            return
+    entry.lat, entry.lon = _UNATTRIBUTED_PIN
+    entry.geo_source = (entry.geo_source or '') + '+unattributed-marker'
+    if entry.city in ('', '??'):
+        entry.city = 'position unattributed'
+
+
+# ===================== GNAT — RECORD EVERYTHING =====================
+# The sqlite feed keeps 22 columns; the attribution pipeline produces far
+# more (coords + pinpoint source, verdict reports, via/domain/geo detail,
+# unmask results, full traces). GnatRecorder is an append-only JSONL layer
+# that drops NOTHING: one JSON object per record, organized as
+#   gnat/connections/connections-YYYY-MM-DD.jsonl   every full entry dict
+#   gnat/attribution/attribution-YYYY-MM-DD.jsonl   verdicts, self-ID
+#                                                    results, labels
+#   gnat/traces/<target>-<ts>.json / .txt           complete trace feeds
+# Writes run on a daemon thread — the scan loop never blocks on disk.
+
+class GnatRecorder:
+    """Append-only recorder: every enriched record is queued and written
+    verbatim. No sampling, no field filtering — 100% of the feed lands."""
+
+    def __init__(self, root: Optional[str] = None):
+        self._root = root or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), 'gnat')
+        self._q: "queue.Queue" = queue.Queue()
+        self._thread: Optional[threading.Thread] = None
+        self._lock = threading.Lock()
+
+    def _start(self):
+        with self._lock:
+            if self._thread is None:
+                os.makedirs(self._root, exist_ok=True)
+                self._thread = threading.Thread(
+                    target=self._loop, daemon=True, name="GnatRecorder")
+                self._thread.start()
+
+    def record(self, kind: str, obj) -> None:
+        if not CONFIG.get('gnat_record', True):
+            return
+        try:
+            self._start()
+            self._q.put_nowait((kind, obj))
+        except (queue.Full, Exception):
+            pass
+
+    def record_bulk(self, kind: str, rows) -> None:
+        if not CONFIG.get('gnat_record', True):
+            return
+        try:
+            self._start()
+            for r in rows:
+                self._q.put_nowait((kind, r))
+        except (queue.Full, Exception):
+            pass
+
+    def _loop(self):
+        while True:
+            try:
+                kind, obj = self._q.get()
+            except Exception:
+                continue
+            try:
+                day = datetime.datetime.utcnow().strftime('%Y-%m-%d')
+                d = os.path.join(self._root, kind)
+                os.makedirs(d, exist_ok=True)
+                rec = dict(obj) if isinstance(obj, dict) else {'data': obj}
+                rec['_kind'] = kind
+                rec['_ts'] = (datetime.datetime.utcnow()
+                              .isoformat(timespec='milliseconds') + 'Z')
+                with open(os.path.join(d, f'{kind}-{day}.jsonl'),
+                          'a', encoding='utf-8') as fh:
+                    fh.write(json.dumps(rec, default=str,
+                                        ensure_ascii=False) + '\n')
+            except Exception as exc:
+                _logger.debug("gnat record failed (%s): %s", kind, exc)
+
+    def save_trace(self, target: str, data: dict, report: str = '') -> str:
+        """Persist a complete trace feed (structured JSON + rendered text)."""
+        if not CONFIG.get('gnat_record', True):
+            return ''
+        try:
+            d = os.path.join(self._root, 'traces')
+            os.makedirs(d, exist_ok=True)
+            safe = re.sub(r'[^A-Za-z0-9.-]+', '_', target)[:80]
+            ts = datetime.datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
+            jp = os.path.join(d, f'{safe}-{ts}.json')
+            with open(jp, 'w', encoding='utf-8') as fh:
+                fh.write(json.dumps(data, default=str, ensure_ascii=False,
+                                    indent=2))
+            if report:
+                with open(jp[:-5] + '.txt', 'w', encoding='utf-8') as fh:
+                    fh.write(report + '\n')
+            return jp
+        except Exception as exc:
+            _logger.debug("gnat trace save failed: %s", exc)
+            return ''
+
+
+GNAT = GnatRecorder()
 
 
 class ConnectionInventory:
@@ -21833,6 +28147,27 @@ class ConnectionInventory:
         # already-prefetched process profiles so new-conn enrichment does
         # not re-run name/exe/parent/cmdline syscalls psutil just serviced.
         self.profile_fn = None
+        # Optional WhoisLookup (RDAP) — names peers GeoIP/rDNS left anonymous.
+        self.whois = None
+        # Optional TlsIdentityProbe — names peers from their TLS certificate.
+        self.tls_probe = None
+        # Optional callable(list[dict]) — persists connection snapshots.
+        self.persist_fn = None
+        # Attribution helpers: ARP/OUI for LAN peers, Cymru DNS for AS holder.
+        self.lan = LanIdentity()
+        self.cymru = CymruResolver()
+        # Passive-DNS reverse-IP + self-naming probe workers — the
+        # channels that still name a peer when DNS/registry data is empty.
+        self.pdns = PassiveDNSReverse()
+        self.ident_probe = SelfIdentProbe()
+        # Socket-owner memory: (proto, local_port, remote_ip, remote_port) ->
+        # owner record. The OS reports PID 0 for TIME_WAIT sockets, so the
+        # owner must be remembered from when the socket was alive.
+        self._owner_mem: dict = {}
+        self._owner_by_remote: dict = {}
+        self._pid_cache: dict = {}
+        self._own_cache = (0.0, frozenset(), ())
+        self._owner_lock = threading.Lock()
         self.loc_verifier = LocationVerifier(service_resolver)
         self.proxy_detector = ProxyDetector()
         self.lock = threading.Lock()
@@ -21842,6 +28177,10 @@ class ConnectionInventory:
         self._vpn_results: dict[str, dict] = {}
         # Set by the monitor: callable(ip) requesting VPN/proxy verification.
         self.verify_request_fn = None
+        # Set by the monitor: callable(ip) -> passive wire-evidence dict —
+        # lets _identify_fallback name a peer from its own banner/cert when
+        # registry, rDNS and provider data all come back empty.
+        self.wire_hint_fn = None
         self.total_unique_ips: set[str] = set()
         self.scan_count = 0
         # Mutation counter covering scan() AND the off-scan writers
@@ -21887,6 +28226,537 @@ class ConnectionInventory:
         entry.timezone = geo.get('timezone', '')
         entry.asn = geo.get('as', '')
         entry.geo_source = geo.get('_source', '')
+
+    def _host_pos(self):
+        """The monitor host's own public position — LAN peers pin beside it.
+        Computed once, cached (including negative)."""
+        pos = getattr(self, '_host_pos_v', 0)
+        if pos == 0:
+            try:
+                pub = _public_ip()
+                geo = (self.geoip.lookup_many([pub]) or {}).get(pub) or {}
+                self._host_pos_v = (geo.get('lat'), geo.get('lon'))
+            except Exception:
+                self._host_pos_v = (None, None)
+            pos = self._host_pos_v
+        return pos
+
+    _ORG_CATEGORY_HINTS = (
+        (('cloudflare', 'akamai', 'fastly', 'edgecast', 'cdn', 'limelight', 'stackpath'), 'CDN'),
+        (('amazon', 'aws', 'google cloud', 'microsoft', 'azure', 'digitalocean', 'linode',
+          'ovh', 'hetzner', 'vultr', 'oracle', 'alibaba', 'tencent', 'hosting', 'cloud',
+          'datacenter', 'data center', 'colo', 'server'), 'Cloud/Hosting'),
+        (('telecom', 'comcast', 'verizon', 'at&t', 'att ', 'spectrum', 'charter', 'cox',
+          'broadband', 'cable', 'wireless', 'mobile', 'communications', 'isp', 'telekom',
+          'vodafone', 'orange', 'telefonica', 'lumen', 'centurylink', 'frontier'), 'ISP'),
+    )
+
+    _TLS_PORTS = frozenset({443, 465, 636, 853, 989, 990, 992, 993, 995, 2083, 2087,
+                            2096, 4443, 5061, 5223, 5986, 6697, 8443, 8883, 9443})
+
+    def _tls_identity(self, entry) -> Optional[dict]:
+        """Name a peer from the TLS certificate it presents. The probe is only
+        sent to public peers this machine is already connected to on a TLS
+        port, rate-limited, and only when attribution probing is enabled."""
+        probe = getattr(self, 'tls_probe', None)
+        ip = entry.remote_ip
+        if (probe is None or not CONFIG.get('attribution_tls_probe')
+                or not CONFIG.get('geoip_enabled')
+                or entry.remote_port not in self._TLS_PORTS or not self._is_public(ip)):
+            return None
+        cert = probe.get(ip)
+        if cert is None:
+            probe.request(ip, entry.remote_port)
+            return None
+        if not cert.get('ok') or not cert.get('subject'):
+            return None
+        subj = cert['subject']
+        cn, org = subj.get('commonName', ''), subj.get('organizationName', '')
+        for name in [cn] + list(cert.get('san', [])):
+            name = (name or '').lstrip('*.').lower()
+            if not name or '.' not in name:
+                continue
+            hit = self.resolver.resolve_domain(name)
+            if hit['service'] != name:
+                hit['domain'] = name
+                hit['via'] = 'TLS certificate'
+                return hit
+        label = org or cn.lstrip('*.')
+        if not label:
+            return None
+        if org and cn and cn.lstrip('*.') != org:
+            label = f"{org} ({cn.lstrip('*.')})"
+        return {'service': label, 'category': 'Website', 'icon': '🔒',
+                'domain': cn.lstrip('*.'), 'via': 'TLS certificate'}
+
+    # ---------- socket-owner memory (PID-0 / TIME_WAIT recovery) ----------
+    def _pid_detail(self, pid: int) -> dict:
+        now = time.time()
+        hit = self._pid_cache.get(pid)
+        if hit and now - hit[0] < 120:
+            return hit[1]
+        det = None
+        if self.profile_fn is not None:
+            try:
+                det = self.profile_fn(pid)
+            except Exception:
+                det = None
+        if det is None:
+            det = self._get_process_detail(pid)
+        if len(self._pid_cache) > 4000:
+            self._pid_cache.clear()
+        self._pid_cache[pid] = (now, det)
+        return det
+
+    def remember_sockets(self, conns) -> None:
+        """Record the owner of every live attributed socket. Called from the
+        0.5s connection mapper (and each scan) so a socket that closes
+        between inventory scans still has a known owner when the OS later
+        reports it as an ownerless TIME_WAIT entry."""
+        if not CONFIG.get('attribution_owner_history', True):
+            return
+        now = time.time()
+        mem = self._owner_mem
+        for c in conns or ():
+            try:
+                if not (c.raddr and c.pid and c.laddr):
+                    continue
+                k = (int(c.type), c.laddr[1], c.raddr[0], c.raddr[1])
+                rec = mem.get(k)
+                if rec is not None:
+                    rec['ts'] = now
+                    continue
+                rec = {'pid': c.pid, 'ts': now, **self._pid_detail(c.pid)}
+                mem[k] = rec
+                self._owner_by_remote[(c.raddr[0], c.raddr[1])] = rec
+            except Exception:
+                continue
+        if len(mem) > 30000:
+            with self._owner_lock:
+                for k, _ in sorted(list(mem.items()), key=lambda kv: kv[1]['ts'])[:10000]:
+                    mem.pop(k, None)
+                for k, v in list(self._owner_by_remote.items()):
+                    if now - v['ts'] > 3600:
+                        self._owner_by_remote.pop(k, None)
+
+    def _recover_owner(self, conn, listen_idx: Optional[dict] = None) -> Optional[tuple]:
+        """Owner of an ownerless (PID 0) socket: exact 4-tuple match from
+        socket history; else the live listener the socket was accepted on
+        (a closed server-side socket's local port is its listener's port);
+        else the most recent owner of the same remote endpoint (explicitly
+        marked inferred)."""
+        if not CONFIG.get('attribution_owner_history', True) or not (conn.laddr and conn.raddr):
+            return None
+        rec = self._owner_mem.get((int(conn.type), conn.laddr[1], conn.raddr[0], conn.raddr[1]))
+        if rec:
+            return rec, 'recovered from socket history'
+        lpid = (listen_idx or {}).get((int(conn.type), conn.laddr[1]))
+        if lpid:
+            return ({'pid': lpid, 'ts': time.time(), **self._pid_detail(lpid)},
+                    f'accepted by the live listener on local port {conn.laddr[1]}')
+        rec = self._owner_by_remote.get((conn.raddr[0], conn.raddr[1]))
+        if rec and time.time() - rec['ts'] < 900:
+            return rec, 'inferred: last owner of this remote endpoint'
+        return None
+
+    # ---------- local / special-address identification ----------
+    def _own_ips(self) -> tuple:
+        ts, ips, nets = self._own_cache
+        if time.time() - ts < 60:
+            return ips, nets
+        addrs, nets_l = set(), []
+        try:
+            for name, lst in psutil.net_if_addrs().items():
+                for a in lst:
+                    if a.family not in (socket.AF_INET, socket.AF_INET6):
+                        continue
+                    host = a.address.split('%')[0]
+                    addrs.add(host)
+                    if a.family == socket.AF_INET and a.netmask:
+                        try:
+                            nets_l.append((ipaddress.ip_network(f"{host}/{a.netmask}", strict=False), name))
+                        except ValueError:
+                            pass
+        except Exception:
+            pass
+        self._own_cache = (time.time(), frozenset(addrs), tuple(nets_l))
+        return self._own_cache[1], self._own_cache[2]
+
+    def _identify_local(self, entry, local_idx: dict) -> Optional[bool]:
+        """Name a non-public peer: the local process on the other end of a
+        loopback/own-address socket, the LAN device (ARP+OUI), the tunnel it
+        routes through, or the reserved-address class. Returns None for
+        public addresses (not applicable), else whether the label changed."""
+        ip, port = entry.remote_ip, entry.remote_port
+        sp = special_range_info(ip)
+        if not sp['kind']:
+            return None
+        own_ips, nets = self._own_ips()
+        svc, cat, icon, via, domain, org = sp['label'] or ip, sp['category'], sp['icon'], 'address class', '', ''
+        # A scoped peer still has a location — 'this machine' or 'this LAN'.
+        # Filling it here keeps the services view and exports from showing
+        # '??' for peers whose location is simply not a country.
+        if entry.country == '??':
+            if sp['kind'] == 'loopback' or ip in own_ips:
+                entry.country = entry.country_code = 'LOCAL'
+                entry.city = 'This machine'
+            elif sp['kind'] in ('private', 'linklocal', 'cgn', 'multicast'):
+                entry.country = entry.country_code = 'LAN'
+                entry.city = 'Local network'
+            else:
+                entry.country = entry.country_code = 'SPECIAL'
+                entry.city = 'Special-use range'
+        if sp['kind'] == 'loopback' or ip in own_ips:
+            pid = (local_idx.get((ip, port, entry.protocol))
+                   or local_idx.get(('*', port, entry.protocol)))
+            if pid:
+                peer = self._pid_detail(pid).get('name') or f'PID:{pid}'
+                svc, icon, via = f"localhost \u21c4 {peer}", '🔌', f'local socket table (peer PID {pid})'
+                domain = f"{peer}:{port}"
+            else:
+                closed = entry.status in ('TIME_WAIT', 'CLOSE_WAIT', 'FIN_WAIT1', 'FIN_WAIT2', 'LAST_ACK', 'CLOSING')
+                svc = (f"localhost (peer port {port} closed)" if closed
+                       else f"localhost (peer port {port}, owner not visible)")
+                via = 'local socket table'
+                icon = '🏠'
+        elif sp['kind'] == 'private':
+            lan = self.lan.identify(ip)
+            host = entry.rdns or self.resolver._rdns_cache.get(ip) or ''
+            if not host and ip not in self.resolver._rdns_cache:
+                self.resolver.queue_reverse_dns(ip)
+            iface = next((n for net, n in nets if ipaddress.ip_address(ip) in net), '')
+            tun = iface and re.search(r'tun|tap|wg|wireguard|vpn|ppp|tailscale|zerotier|zt|fortinet|anyconnect|globalprotect',
+                                      iface, re.I)
+            who = host.split('.')[0] if host else ''
+            if lan['gateway']:
+                svc, via = f"Gateway/router {who or ip}" + (f" ({lan['vendor']})" if lan['vendor'] else ''), 'ARP + route table'
+                icon = '🛜'
+            elif lan['mac']:
+                sid = self._self_ident_label(ip, port, (entry.protocol or 'tcp').lower())
+                if sid:
+                    svc = (f"LAN {sid['service']}"
+                           + (f" ({lan['vendor']})" if lan['vendor'] else '')
+                           + (f" '{who}'" if who else f" {ip}"))
+                    via, icon = 'self-naming probe + ARP', sid['icon']
+                else:
+                    what = lan['vendor'] or ('device with randomised MAC' if lan['randomized_mac'] else f"device {lan['mac']}")
+                    svc, via = f"LAN {what}" + (f" '{who}'" if who else f" {ip}"), 'ARP + OUI vendor'
+            elif tun:
+                svc, via = f"VPN-tunnel peer {who or ip} via {iface}", 'interface route'
+                icon = '🔒'
+            elif host:
+                svc, via = f"LAN host {who}", 'reverse DNS'
+            elif (sid := self._self_ident_label(ip, port, (entry.protocol or 'tcp').lower())):
+                svc, via = f"LAN {sid['service']}", sid['via']
+                icon = sid['icon']
+            elif iface:
+                svc, via = f"LAN host {ip} (on {iface}, not in neighbour table)", 'interface route'
+            else:
+                svc, via = f"Routed private network {ip} (no local interface)", 'address class'
+            org = lan['vendor']
+        elif sp.get('embedded'):
+            svc, via = sp['label'], 'address decoding'
+            domain = sp['embedded']
+        if sp['kind'] == 'private' and not lan_known_role(svc):
+            hint = _LAN_PORT_HINTS.get(port)
+            if hint:
+                svc = svc.replace('LAN ', f'LAN {hint} ', 1) if svc.startswith('LAN ') else f"{svc} [{hint}]"
+        if org and entry.org in ('Unknown', ''):
+            entry.org = org
+        try:
+            _pinpoint_coords(entry, self._host_pos())
+        except Exception:
+            pass
+        if (svc, via) == (entry.service, entry.via):
+            return False
+        entry.service, entry.category, entry.icon, entry.via, entry.domain = svc, cat, icon, via, domain
+        entry.website_tag = self._compute_website_tag(entry)
+        return True
+
+    # ---------- public-peer identification ----------
+    _WEAK_VIA = ('process + port', 'registered network owner', 'published provider ranges',
+                 'process + shared edge (inferred)', 'provider VPN feed',
+                 'passive DNS reverse-IP', 'self-naming probe', 'self-naming probe + ARP',
+                 'port only')
+
+    def _provider_identity(self, ip: str) -> Optional[dict]:
+        if not CONFIG.get('attribution_provider_ranges', True) or not CONFIG.get('geoip_enabled'):
+            return None
+        PROVIDER_RANGES.ensure()
+        hit = PROVIDER_RANGES.lookup(ip)
+        if not hit:
+            return None
+        return {'service': hit['label'], 'category': hit['category'],
+                'icon': '☁️' if hit['category'] != 'CDN' else '🌐', 'domain': '',
+                'via': 'published provider ranges'}
+
+    @staticmethod
+    def _vpn_feed_identity(ip: str) -> Optional[dict]:
+        # Memory-only: never triggers the 30MB disk parse from the scan loop.
+        if not _exit_feed_cache['ts']:
+            return None
+        ent = _exit_feed_cache['ips'].get(ip)
+        if not ent:
+            return None
+        loc = ', '.join(x for x in (ent.get('city'), ent.get('cc')) if x)
+        return {'service': f"{ent.get('provider')} {ent.get('kind', 'vpn')} server"
+                           + (f" {ent['host']}" if ent.get('host') else '') + (f" ({loc})" if loc else ''),
+                'category': 'VPN', 'icon': '🔒', 'domain': ent.get('host', ''), 'via': 'provider VPN feed'}
+
+    def _pdns_identity(self, ip: str) -> Optional[dict]:
+        """Name a peer from the sites passive DNS says are hosted on it —
+        on shared infrastructure the tenants ARE the identity."""
+        if not CONFIG.get('attribution_passive_dns', True):
+            return None
+        pd = getattr(self, 'pdns', None)
+        if pd is None:
+            return None
+        try:
+            res = pd.get(ip)
+        except Exception:
+            return None
+        if isinstance(res, dict):
+            names = list(res.get('names') or [])
+            confirmed = set(res.get('confirmed') or [])
+        elif res:
+            names, confirmed = list(res), set()
+        else:
+            return None
+        if not names:
+            return None
+        best = next((n for n in names if n in confirmed), None)             or ServiceResolver._pick_best_website_domain(names)
+        via = ('passive DNS reverse-IP (forward-confirmed)'
+               if best in confirmed else 'passive DNS reverse-IP')
+        hit = self.resolver.resolve_domain(best)
+        if hit['service'] != best.lower():
+            hit['domain'] = best
+            hit['via'] = via
+            info = hit
+        else:
+            info = {'service': best, 'category': 'Website', 'icon': '🌐',
+                    'domain': best, 'via': via}
+        if len(names) > 1:
+            info['service'] += f" (+{len(names) - 1} co-hosted)"
+        return info
+
+    def _self_ident_label(self, ip: str, port: int = 0, proto: str = 'tcp') -> Optional[dict]:
+        """Name a peer from the identity it volunteers: NBNS workstation
+        name, SNMP sysName, SSDP/UPnP banner, SQL-browser instance, mDNS
+        hostname or NTP stratum — whichever the endpoint answered."""
+        if not CONFIG.get('attribution_ident_probe', True):
+            return None
+        sid = getattr(self, 'ident_probe', None)
+        if sid is None:
+            return None
+        try:
+            res = sid.get(ip, port, proto)
+        except Exception:
+            return None
+        if not res:
+            return None
+        nb = res.get('nbns_names') or []
+        best = ''
+        for n in nb:
+            b = n.split('<')[0].strip()
+            suf = n.split('<', 1)[1] if '<' in n else ''
+            if b and not b.startswith('__') and suf.startswith('00'):
+                best = b
+                break
+        if not best:
+            best = next((n.split('<')[0].strip() for n in nb
+                         if n.split('<')[0].strip()
+                         and not n.split('<')[0].startswith('__')), '')
+        vend = res.get('nbns_vendor') or ''
+        base, cat, icon = '', 'Workstation', '💻'
+        vu = res.get('vpn_udp') or {}
+        if vu.get('ike') or vu.get('openvpn'):
+            if vu.get('ike'):
+                nm = 'IKE/IPsec VPN gateway'
+                if vu.get('ike_vendor'):
+                    nm += f" ({vu['ike_vendor']})"
+            else:
+                nm = 'OpenVPN server'
+            base = f"{nm} :{vu.get('port', port)} [protocol handshake reply]"
+            dom, cat, icon = '', 'VPN', '🔒'
+        elif best:
+            base = best + (f" [{vend}]" if vend and not vend.startswith('Unknown') else '')
+            dom = best
+        elif res.get('snmp'):
+            s = re.sub(r'^.*=', '', str(res['snmp'][0])).strip() or str(res['snmp'][0])
+            base, dom = f"{s[:60]} (SNMP self-report)", ''
+            cat, icon = 'Network device', '🖧'
+        elif res.get('ssrp'):
+            s = res['ssrp']
+            base, dom = (f"MSSQL {s.get('name', '?')}\\{s.get('instance', '?')} "
+            f"v{s.get('version', '?')}"), ''
+            cat, icon = 'Database', '🗄'
+        elif res.get('ssdp'):
+            s = res['ssdp']
+            base = str(s.get('friendlyName') or s.get('server') or s.get('location') or '')[:60]
+            dom, cat, icon = '', 'UPnP device', '📡'
+        elif res.get('http') and res['http'].get('open'):
+            h = res['http']
+            hd = h.get('headers') or {}
+            pg = res.get('page') or {}
+            title = pg.get('title') or pg.get('generator') or ''
+            stack = hd.get('Server') or ''
+            base = (title or stack or h.get('status') or 'HTTP service')[:80]
+            if title and stack and stack.lower() not in title.lower():
+                base += f" [{stack[:40]}]"
+            extra = (hd.get('X-Powered-By') or hd.get('X-Backend-Server')
+                     or hd.get('X-Served-By') or hd.get('CF-RAY') or '')
+            base += (f" ({extra[:50]})" if extra else '') + ' [HTTP self-report]'
+            dom, cat, icon = '', 'Web service', '🌐'
+        elif res.get('banner_guess'):
+            base = f"{res['banner_guess'][:90]} :{res.get('banner_port', '')}"
+            dom, cat, icon = '', 'Network service', '📡'
+        elif res.get('mdns_names'):
+            dom = res['mdns_names'][0]
+            base = f"{dom} (mDNS)"
+            cat, icon = 'LAN device', '📡'
+        elif res.get('ntp'):
+            n = res['ntp']
+            base = (f"NTP server (stratum {n.get('stratum', '?')})"
+                    + (f" ← {n['refid_ip']}" if n.get('refid_ip') else ''))
+            dom, cat, icon = '', 'Time server', '🕐'
+        if not base:
+            return None
+        return {'service': base, 'category': cat, 'icon': icon, 'domain': dom,
+                'via': 'self-naming probe'}
+
+    def _identify_fallback(self, entry) -> bool:
+        """Name a connection the domain/rDNS path could not.
+
+        Evidence chain, strongest first: reverse DNS (own cache or verifier),
+        TLS certificate, provider VPN server feeds, provider-published address
+        ranges (exact service/region), registered network owner (GeoIP ->
+        RDAP -> Team Cymru DNS), the owning process's vendor when the peer is
+        a shared edge (marked inferred), then process + well-known port. The
+        source is recorded in ``via`` so nothing is passed off as stronger
+        evidence than it is. Returns True when the label changed.
+        """
+        cur = entry.service
+        ip, port = entry.remote_ip, entry.remote_port
+        weak = (ServiceResolver._is_unresolved(cur) or cur.startswith('Unresolved')
+                or entry.via in self._WEAK_VIA)
+        if not weak:
+            return False
+        host = entry.rdns or self.resolver._rdns_cache.get(ip) or ''
+        tls_info = None if host else self._tls_identity(entry)
+        proc = entry.process_name or ''
+        pname = _PORT_SERVICES.get(port) or _PORT_NAMES.get(port) or ''
+        public = self._is_public(ip)
+        info = None
+        if host:
+            info = self.resolver.resolve_domain(host)
+            info['domain'] = host
+            info['via'] = info.get('via') or 'reverse DNS'
+        elif tls_info:
+            info = tls_info
+        elif public and (info := self._vpn_feed_identity(ip)):
+            pass
+        elif public and (info := self._provider_identity(ip)):
+            if pname:
+                info['service'] += f" ({pname})"
+        elif public and (info := self._pdns_identity(ip)):
+            pass
+        else:
+            org = ''
+            for cand in (entry.asn_org, entry.org, entry.isp):
+                if cand and cand != 'Unknown':
+                    org = cand
+                    break
+            whois = getattr(self, 'whois', None)
+            if (not org and whois is not None and CONFIG.get('attribution_rdap')
+                    and CONFIG.get('geoip_enabled') and public):
+                rd = whois.cache.get(ip)
+                if rd is None:
+                    whois.warm(ip)
+                elif not rd.get('error'):
+                    org = next((e['name'] for e in rd.get('entities', [])
+                                if e.get('name') and 'registrant' in e.get('roles', [])), '') \
+                        or rd.get('name', '')
+                    if org in ('?', ''):
+                        org = ''
+                    elif not entry.asn_org:
+                        entry.asn_org = org
+            if (not org and public and CONFIG.get('attribution_cymru')
+                    and CONFIG.get('geoip_enabled')):
+                cy = self.cymru.get(ip) if getattr(self, 'cymru', None) else None
+                if cy and cy.get('name'):
+                    org = cy['name']
+                    entry.asn_org = entry.asn_org or org
+                    entry.asn = entry.asn or cy.get('asn', '')
+            if org:
+                low = org.lower()
+                cat = next((c for keys, c in self._ORG_CATEGORY_HINTS
+                            if any(k in low for k in keys)), 'Network Operator')
+                label = f"{org} ({pname})" if pname else org
+                info = {'service': label, 'category': cat, 'icon': '🏢',
+                        'domain': '', 'via': 'registered network owner', '_owner': org}
+            else:
+                winfo = self._wire_identity(ip, pname) if public else None
+                sid = None if winfo else (self._self_ident_label(ip, port, (entry.protocol or 'tcp').lower()) if public else None)
+                if winfo:
+                    info = winfo
+                elif sid:
+                    info = sid
+                elif proc and public:
+                    label = f"{proc} \u2192 {pname or 'port ' + str(port)} (owner lookup pending)"
+                    info = {'service': 'Unresolved: ' + label, 'category': 'Unattributed',
+                            'icon': '🔎', 'domain': '', 'via': 'process + port'}
+                elif proc:
+                    info = {'service': f"{proc} \u2192 {pname or 'port ' + str(port)}",
+                            'category': 'Application', 'icon': '🧩',
+                            'domain': '', 'via': 'process + port'}
+                elif public:
+                    info = {'service': f"Unresolved: {pname or entry.protocol + '/' + str(port)} endpoint "
+                                       "(no DNS, registry, wire or self-naming identity)",
+                            'category': 'Unattributed', 'icon': '🔎',
+                            'domain': '', 'via': 'port only'}
+        # A shared CDN/cloud edge is named by the vendor whose client process
+        # is talking to it — inferred, and labelled as such.
+        backend = _APP_BACKENDS.get(proc.lower())
+        if (info and backend and public and info.get('via') in ('registered network owner', 'published provider ranges')
+                and info.get('category') in ('CDN', 'CDN/Cloud', 'Cloud/Hosting', 'Network Operator')):
+            owner = info.get('_owner') or info['service']
+            info = {'service': f"{backend} (via {owner}, inferred from process)",
+                    'category': info['category'], 'icon': '🧭', 'domain': '',
+                    'via': 'process + shared edge (inferred)'}
+        if not info or info['service'] == cur:
+            return False
+        entry.service = info['service']
+        entry.category = info.get('category', entry.category)
+        entry.icon = info.get('icon', entry.icon)
+        entry.domain = info.get('domain', '')
+        entry.via = info.get('via', entry.via)
+        if host and not entry.rdns:
+            entry.rdns = host
+        entry.website_tag = self._compute_website_tag(entry)
+        return True
+
+    def _wire_identity(self, ip: str, pname: str = '') -> Optional[dict]:
+        """Name a public peer from the passive wire harvest when every
+        registry path failed — the host's own greeting banner, TLS
+        certificate CN, Server banner or SSH version string is an identity
+        it volunteered on the wire."""
+        fn = getattr(self, 'wire_hint_fn', None)
+        if fn is None:
+            return None
+        try:
+            w = fn(ip) or {}
+        except Exception:
+            return None
+        name = (str(w.get('cert_cn') or '').split(',')[0].strip()
+                or str(w.get('passban') or '').split(':', 1)[-1].strip()
+                or str(w.get('srvban') or '').strip()
+                or str(w.get('sshver') or '').strip()
+                or str(w.get('srvvia') or '').strip())
+        if not name or len(name) < 3:
+            return None
+        return {'service': f"{name[:60]} ({pname})" if pname else name[:60],
+                'category': 'Network Operator', 'icon': '📡', 'domain': '',
+                'via': 'passive wire identity'}
 
     def _classify_proxy(self, entry) -> None:
         """(Re)run proxy classification for an entry.
@@ -21940,6 +28810,24 @@ class ConnectionInventory:
                 provider = lbl
                 break
         entry.vpn_provider = provider
+        # A proven anonymizer/infra verdict IS an identity — upgrade a weak
+        # or placeholder service label so the row names what the endpoint is.
+        svc_weak = (ServiceResolver._is_unresolved(entry.service)
+                    or entry.service.startswith('Unresolved')
+                    or entry.via in ConnectionInventory._WEAK_VIA)
+        verdict = next(((cat, icon) for flag, cat, icon in (
+            (entry.is_tor, 'Anonymizer', '🧅'),
+            (entry.is_vpn, 'VPN', '🔒'),
+            (entry.is_proxy, 'Proxy', '🔁'),
+            (entry.is_cdn, 'CDN', '🌐'),
+            (entry.is_hosting, 'Cloud/Hosting', '☁️')) if flag), None)
+        if svc_weak and verdict:
+            label = provider or {'Anonymizer': 'Tor relay/exit', 'VPN': 'VPN server',
+                                 'Proxy': 'proxy relay', 'CDN': 'CDN edge',
+                                 'Cloud/Hosting': 'hosting endpoint'}[verdict[0]]
+            entry.service = f"{label} (verified)"
+            entry.category, entry.icon = verdict
+            entry.via = 'MultiVerifier verdict'
 
     def apply_verification(self, ip: str, rep: dict) -> None:
         """Called by the monitor's verification worker: fan a finished
@@ -21955,6 +28843,11 @@ class ConnectionInventory:
             for entry in targets:
                 self._apply_verification(entry, rep)
                 entry.website_tag = self._compute_website_tag(entry)
+            GNAT.record('attribution', {
+                'ip': ip, 'kind_detail': 'verification verdict',
+                'verdict': rep,
+                'service': targets[0].service if targets else '',
+                'via': targets[0].via if targets else ''})
             if targets:
                 self.mut_seq += 1
 
@@ -22060,10 +28953,24 @@ class ConnectionInventory:
                         vpn_rep = self._vpn_results.get(ip)
                     for entry in targets:
                         self._apply_geo(entry, geo)
+                        if (entry.country_code or '??') == '??':
+                            try:
+                                cy = cymru_asn_lookup(ip)
+                                if cy:
+                                    if cy.get('cc'):
+                                        entry.country_code = cy['cc']
+                                        if entry.country in ('', '??'):
+                                            entry.country = f"{cy['cc']} (registry)"
+                                    if not entry.asn and cy.get('asn'):
+                                        entry.asn = cy['asn']
+                            except Exception:
+                                pass
+                        _pinpoint_coords(entry)
                         self._classify_proxy(entry)
                         if vpn_rep:
                             self._apply_verification(entry, vpn_rep)
                         entry.website_tag = self._compute_website_tag(entry)
+                        self._identify_fallback(entry)
                     with self.lock:
                         for entry in targets:
                             self._record_service(entry, now)
@@ -22230,6 +29137,19 @@ class ConnectionInventory:
         now = time.time()
         active_keys = set()
         conns = self._get_connections()
+        self.remember_sockets(conns)
+        # Live sockets first, so an ownerless socket recovered onto the same
+        # key never overwrites the live socket's status.
+        conns = sorted(conns, key=lambda c: 0 if c.pid else 1)
+        local_idx: dict = {}
+        for c in conns:
+            if c.laddr and c.pid:
+                h = c.laddr[0]
+                local_idx[('*' if h in ('0.0.0.0', '::', '') else h, c.laddr[1],
+                           'TCP' if c.type == 1 else 'UDP')] = c.pid
+        live_keys: set = set()
+        listen_idx = {(int(c.type), c.laddr[1]): c.pid for c in conns
+                      if c.pid and c.laddr and not c.raddr}
         # Pre-fetch existing connections under a single lock acquisition to
         # avoid per-connection lock contention. New entries are added in a
         # batch at the end.
@@ -22244,18 +29164,35 @@ class ConnectionInventory:
             remote_ip = conn.raddr[0]
             remote_port = conn.raddr[1]
             pid = conn.pid or 0
+            recovered = None
+            if not pid:
+                recovered = self._recover_owner(conn, listen_idx)
+                if recovered:
+                    pid = recovered[0]['pid']
             key = (remote_ip, remote_port, pid)
             active_keys.add(key)
+            if pid and not recovered:
+                live_keys.add(key)
+            elif recovered and key in live_keys:
+                if key in existing:
+                    existing[key].last_seen = now
+                continue
             if key in existing:
                 # Update existing entry in-place (no lock — only this thread writes)
                 entry = existing[key]
                 entry.last_seen = now
                 entry.status = conn.status
+                loc = self._identify_local(entry, local_idx)
+                if loc is not None:
+                    if loc:
+                        self._record_service(entry, now)
+                    continue
                 # If entry has no geo data yet, check if GeoIP is now cached
                 if entry.lat == 0 and entry.lon == 0 and self._is_public(remote_ip):
                     cached_geo = self.geoip.get_cached(remote_ip)
                     if cached_geo:
                         self._apply_geo(entry, cached_geo)
+                        _pinpoint_coords(entry)
                         self._classify_proxy(entry)
                         entry.website_tag = self._compute_website_tag(entry)
                         self._queue_verification(remote_ip, cached_geo)
@@ -22299,11 +29236,17 @@ class ConnectionInventory:
                         entry.domain = svc_info.get('domain', entry.domain)
                         entry.via = svc_info.get('via', entry.via)
                         entry.website_tag = self._compute_website_tag(entry)
+                if self._identify_fallback(entry):
+                    self._record_service(entry, now)
                 continue
             # --- New connection: full process detail, reusing the watcher's
             # prefetched profile when available (saves ~4 syscalls per conn).
             pdetail = None
-            if self.profile_fn is not None:
+            if recovered:
+                pdetail = dict(recovered[0])
+                if recovered[1].startswith('inferred'):
+                    pdetail['name'] = f"{pdetail['name']} (inferred)"
+            elif self.profile_fn is not None:
                 try:
                     pdetail = self.profile_fn(pid)
                 except Exception:
@@ -22311,6 +29254,14 @@ class ConnectionInventory:
             if pdetail is None:
                 pdetail = self._get_process_detail(pid)
             entry = ConnectionEntry()
+            if recovered:
+                entry.owner_via = recovered[1]
+            elif not pid:
+                entry.owner_via = ('owner exited before it was observed (the OS reports TIME_WAIT '
+                                   'sockets with no PID)' if conn.status == 'TIME_WAIT'
+                                   else 'owner hidden from this account (run as Administrator)')
+            elif pid == os.getpid():
+                entry.owner_via = 'monitor self-probe (verification traffic)'
             entry.pid = pid
             entry.process_name = pdetail['name']
             entry.exe_path = pdetail['exe_path']
@@ -22334,6 +29285,7 @@ class ConnectionInventory:
             entry.via = svc_info.get('via', '')
             entry.all_domains = sorted(domains) if domains else []
             is_pub = self._is_public(remote_ip)
+            loc = None if is_pub else self._identify_local(entry, local_idx)
             if is_pub:
                 # Check cache first — only do synchronous API lookup if cached.
                 # If not cached, queue for background enrichment so the scan
@@ -22341,6 +29293,7 @@ class ConnectionInventory:
                 cached_geo = self.geoip.get_cached(remote_ip)
                 if cached_geo:
                     self._apply_geo(entry, cached_geo)
+                    _pinpoint_coords(entry)
                     self._queue_verification(remote_ip, cached_geo)
                 else:
                     # Queue for background GeoIP enrichment
@@ -22356,6 +29309,8 @@ class ConnectionInventory:
             if cached_vpn:
                 self._apply_verification(entry, cached_vpn)
             entry.website_tag = self._compute_website_tag(entry)
+            if loc is None:
+                self._identify_fallback(entry)
             if is_pub:
                 self.total_unique_ips.add(remote_ip)
                 # Every public endpoint gets VPN/proxy cross-verification, not
@@ -22379,6 +29334,15 @@ class ConnectionInventory:
                 del self.connections[k]
             self.scan_count += 1
             self.mut_seq += 1
+            persist_now = (self.persist_fn is not None and CONFIG.get('db_persist_connections')
+                           and self.scan_count % CONFIG.get('db_persist_interval_scans', 20) == 0)
+            snap = [e.to_dict() for e in self.connections.values()] if persist_now else None
+        if snap:
+            GNAT.record_bulk('connections', snap)
+            try:
+                self.persist_fn(snap)
+            except Exception as exc:
+                _logger.debug("Connection persist failed: %s", exc)
 
     def get_all(self) -> list[dict]:
         with self.lock:
@@ -26134,6 +33098,8 @@ class GNATracerGUI:
                         lines.append(f"  Parent: {parent_n} (PID {conn.get('parent_pid', '?')})")
                     if conn.get('cmdline'):
                         lines.append(f"  Command: {str(conn['cmdline'])[:200]}")
+                    if conn.get('owner_via'):
+                        lines.append(f"  Owner evidence: {conn['owner_via']}")
                     lines.append(f"  Remote: {ip}:{conn.get('remote_port', '?')}")
                     lines.append(f"  Local: {conn.get('local_ip', '?')}:{conn.get('local_port', '?')}")
                     lines.append(f"  Protocol: {conn.get('protocol', '?')}")
@@ -29807,6 +36773,7 @@ class GNATracerGUI:
                        "dim")
             cmd = c.get('cmdline')
             self._irow(w, "cmdline", (cmd[:200] + '…' if cmd and len(cmd) > 200 else cmd), "dim")
+            self._irow(w, "owner via", c.get('owner_via'), "dim")
         # --- geolocation ---
         self._isec(w, "GEOLOCATION")
         cc = c.get('country_code')
@@ -37654,6 +44621,8 @@ class GNATracerGUI:
                              f"(PID {c.get('parent_pid', '?')})")
             if c.get('cmdline'):
                 lines.append(f"      Cmdline:     {str(c['cmdline'])[:180]}")
+            if c.get('owner_via'):
+                lines.append(f"      Owner via:   {c['owner_via']}")
             lines.append(f"      Remote:      {c.get('remote_ip', '?')}:{c.get('remote_port', '?')}")
             lines.append(f"      Local:       {c.get('local_ip', '?')}:{c.get('local_port', '?')}")
             lines.append(f"      Protocol:    {c.get('protocol', '?')} — Status: {c.get('status', '?')}")
@@ -38794,7 +45763,11 @@ def start_dashboard(get_state_fn, stop_event):
         _logger.info("Dashboard authentication enabled (token required)")
 
     try:
+        cert = CONFIG.get('dashboard_cert') or None
         uvicorn.run(app, host="127.0.0.1", port=CONFIG['dashboard_port'],
+                    ssl_certfile=cert,
+                    ssl_keyfile=(CONFIG.get('dashboard_key') or None)
+                    if cert else None,
                     log_level="warning")
     except Exception as e:
         _logger.warning("Dashboard failed: %s", e)
@@ -38917,6 +45890,17 @@ class MedianBoxMonitor:
 
         # Tier 4
         self.ml_baseline = StatisticalBaseline()
+        _bl_path = CONFIG.get('ml_baseline_file')
+        if _bl_path:
+            _n = self.ml_baseline.load(_bl_path)
+            if _n:
+                _logger.info("Restored ML baseline for %d processes from %s", _n, _bl_path)
+        self.alerter = WebhookAlerter()
+        self.auto_responder = AutoResponder()
+        self.authenticode = AuthenticodeVerifier()
+        self.sigscan = SignatureScanner()
+        self._sig_flagged: set = set()
+        self._sigscan_flagged: set = set()
         self.ja4plus = JA4Plus()
 
         # Tier 5 — New detectors
@@ -39020,6 +46004,8 @@ class MedianBoxMonitor:
         # can hear, RSSI distance estimation, trilateration when multi-
         # position observations exist. Feeds the SIGNALS tab + raw feeds.
         self.spectrum = SpectrumHub(local_geo_fn=self._get_local_geoip)
+        self.spectrum.db = self.db
+        self.spectrum.registry._event_sink = self.db.save_rf_event
         self.proxy_detector = ProxyDetector()
         self.vpn_leak_detector = VPNLeakDetector()  # stop_event wired after self.stop exists
         # Anti-hack monitors (18 features)
@@ -39100,6 +46086,13 @@ class MedianBoxMonitor:
                     'parent_name': p.parent_name, 'parent_pid': p.parent_pid,
                     'cmdline': p.cmdline or ''}
         self.conn_inventory.profile_fn = _profile_detail
+        self.conn_inventory.persist_fn = self.db.save_connections
+        self.conn_inventory.whois = self.whois_lookup
+        self.conn_inventory.tls_probe = TlsIdentityProbe()
+        if CONFIG.get('ml_baseline_file'):
+            self.ml_baseline.start_autosave(
+                CONFIG['ml_baseline_file'], self.stop,
+                CONFIG.get('ml_baseline_save_interval', 300))
 
         # Multi-method cross-verification (shared between monitor and GUI).
         # Placed after service_resolver so LocationVerifier has a resolver.
@@ -39136,6 +46129,12 @@ class MedianBoxMonitor:
             self._verify_threads.append(t)
         # Let the inventory ask for verification of every endpoint it sees.
         self.conn_inventory.verify_request_fn = self._queue_ip_verification
+        # And let it name endpoints from the passive wire harvest — a
+        # greeting banner / cert CN identifies a host no registry can.
+        self.conn_inventory.wire_hint_fn = self._wire_hint_for
+        # The module-level trace reads the same harvest through this hook,
+        # so --trace run from a live monitor shows every de-masking channel.
+        register_wire_evidence(self._wire_for_trace)
 
         self._print_banner()
 
@@ -39250,10 +46249,20 @@ class MedianBoxMonitor:
         }
         # deque.append is thread-safe in CPython — no lock needed for append-only
         self.suspicious_events.append(event)
+        try:
+            self.db.save_monitor_event(event)
+        except Exception:
+            pass
         with self.lock:
             # seq bump must be atomic — a lost increment would leave the
             # suspicious feed's cached copies stale until the next event.
             self._susp_seq += 1
+        alerter = getattr(self, 'alerter', None)
+        if alerter is not None and severity == 'CRITICAL':
+            try:
+                alerter.notify(severity, category, process, pid, description, details)
+            except Exception as exc:
+                _logger.debug("Alert dispatch error: %s", exc)
 
     def _auto_flag_action(self, pid, name, action, extra):
         """Check if an action matches suspicious patterns and auto-flag it."""
@@ -39583,6 +46592,18 @@ class MedianBoxMonitor:
                 except Exception:
                     pass
 
+    def _wire_for_trace(self, ip: str) -> dict:
+        """Wire view for the module-level trace: _wire_hint_for plus the one
+        flag it omits — whether this address was itself decapsulated from
+        inside a tunnelled flow."""
+        w = self._wire_hint_for(ip)
+        try:
+            if ip in self._inner_seen:
+                w['_was_inner'] = True
+        except Exception:
+            pass
+        return w
+
     def _wire_hint_for(self, ip: str) -> dict:
         """Assemble the passive WIRE evidence dict for one public IP —
         silent-tunnel signatures harvested by the sniffer (WireGuard /
@@ -39669,6 +46690,23 @@ class MedianBoxMonitor:
                 if best and best[0] <= 0.15:
                     w['flowcorr'] = f"{_pk}:{best[1]}:{best[0]:.3f}"
                 sigs[(ip, _pk)] = (_pk, _vec, now)
+            # WATERMARK CORRELATION — every flow this host can see is
+            # continuously scored against the pacing patterns we injected
+            # into demask-page responses. A match means the shaped flow
+            # surfaced here: the two observation points are joined.
+            try:
+                if FLOWCORR.patterns:
+                    for _pk, _fe in (self._flowstats.get(ip) or {}).items():
+                        _ts = sorted(t for t in (_fe.get('ts') or []) if t)
+                        _gms = [(b - a) * 1000.0 for a, b in zip(_ts, _ts[1:])
+                                if 0 < b - a <= 120.0]
+                        if len(_gms) >= 6:
+                            r = FLOWCORR.record_flow(
+                                f'wire:{ip}:{_pk}', _gms, src='local-wire')
+                            if r['matched']:
+                                w['wm_match'] = f"{_pk}:{r['wm']}:{r['score']}"
+            except Exception:
+                pass
         except Exception:
             pass
         # TSFREQ — TCP timestamp clock-frequency device fingerprint.
@@ -39853,8 +46891,77 @@ class MedianBoxMonitor:
         self._write_deduction_log(d)
         self.db.save_deduction(d)
         self.siem.emit(d)
+        try:
+            action = self.auto_responder.consider(
+                pid, proc_name, escalated_score, severity, message) or ''
+            if action:
+                self._log(f"{EMOJI['alert']} AUTO-RESPONSE {proc_name} (PID {pid}): {action}",
+                          color=Colors.R)
+            self.alerter.notify(severity, category, proc_name, pid, message, evidence, action)
+        except Exception as exc:
+            _logger.debug("Response/alert dispatch error: %s", exc)
         # Every deduction is a suspicious event
         self._flag_suspicious(category, severity, proc_name, pid, message, list(evidence))
+
+    _SIG_RISKY_DIRS = ('\\appdata\\', '\\temp\\', '\\downloads\\', '\\programdata\\',
+                       '\\users\\public\\', '\\$recycle.bin\\')
+
+    def _check_sigscan(self, profile, path):
+        """Byte-signature scan of the connected process's on-disk image.
+        A hit flags SIGNATURE_HIT once per path."""
+        if not CONFIG.get('signature_scan', True):
+            return
+        key = path.lower()
+        if key in self._sigscan_flagged:
+            return
+        res = self.sigscan.get_cached(path)
+        if res is None:
+            self.sigscan.request(path)
+            return
+        if res and res.get('hit'):
+            self._sigscan_flagged.add(key)
+            self._flag_suspicious(
+                'SIGNATURE_HIT', res.get('severity', 'CRITICAL'),
+                profile.name, profile.pid,
+                f"Signature match: {res['hit']}" +
+                (f" — {res.get('desc')}" if res.get('desc') else ''),
+                [f'Executable: {path}', f'Rule: {res["hit"]}',
+                 f'Rules loaded: {res.get("rules", 0)}'])
+
+    def _check_signature(self, profile, dst_ip, dst_port):
+        """Authenticode verdict on a process that is talking to the internet.
+        HashMismatch (tampered after signing) is CRITICAL; an unsigned binary
+        running from a user-writable directory is a WARNING. Unsigned binaries
+        elsewhere are not flagged (many legitimate tools are unsigned)."""
+        path = profile.exe_path
+        if not path or not os.path.isabs(path) or path.lower() in self._sig_flagged:
+            return
+        if not self._is_public_ip(dst_ip):
+            return
+        self._check_sigscan(profile, path)
+        if not (_IS_WINDOWS and CONFIG.get('authenticode_enabled')):
+            return
+        res = self.authenticode.get_cached(path)
+        if res is None:
+            self.authenticode.request(path)
+            return
+        key = path.lower()
+        status = res.get('status')
+        risky = any(d in key for d in self._SIG_RISKY_DIRS)
+        if status in ('HashMismatch', 'NotTrusted') or (status == 'NotSigned' and risky):
+            self._sig_flagged.add(key)
+            sev = 'CRITICAL' if status == 'HashMismatch' else 'WARNING'
+            self._flag_suspicious(
+                'CODE_SIGNING', sev, profile.name, profile.pid,
+                f'{profile.name} has Authenticode status {status} and is using the network',
+                [f'Executable: {path}', f'Signature status: {status}',
+                 f'Signer: {res.get("cn") or "(none)"}',
+                 f'Destination: {dst_ip}:{dst_port}',
+                 'HashMismatch means the file was modified after it was signed'
+                 if status == 'HashMismatch' else
+                 'Unsigned/untrusted binary in a user-writable location'])
+        elif status in ('Valid', 'NotSigned'):
+            self._sig_flagged.add(key)
 
     # ---------- DEDUCTION 1: Mimic Traffic ----------
     def _check_mimic(self, profile, dst_ip, domains):
@@ -40775,9 +47882,24 @@ class MedianBoxMonitor:
 
     def _check_exfil_channel(self, profile, dst_ip, domains):
         """Check 17: Detect connections to known exfil/C2 channels."""
+        c2_desc = THREAT_INTEL.c2_ips().get(str(dst_ip))
+        if c2_desc:
+            evidence = [
+                f'Process: {profile.name} (PID {profile.pid})',
+                f'Destination: {dst_ip}',
+                f'Active C2 indicator: {c2_desc}',
+            ]
+            self._add_deduction('CRITICAL', 'C2_ENDPOINT',
+                profile.name, profile.pid,
+                f'C2 ENDPOINT: {profile.name} connected to {dst_ip}',
+                evidence, 60.0)
+            self._pin_to_conns(profile.pid, 'C2_ENDPOINT',
+                f'C2 endpoint: {dst_ip}')
+            self._flag_suspicious('C2_ENDPOINT', 'CRITICAL', 'Process',
+                profile.pid, f'C2 endpoint {dst_ip}', evidence)
         for domain in domains:
             domain_lower = domain.lower()
-            for channel in self._EXFIL_CHANNELS:
+            for channel in self._EXFIL_CHANNELS | THREAT_INTEL.exfil_channels():
                 if domain_lower == channel or domain_lower.endswith('.' + channel):
                     evidence = [
                         f"Process: {profile.name} (PID {profile.pid})",
@@ -40987,7 +48109,7 @@ class MedianBoxMonitor:
     def _check_lolbin_abuse(self, profile):
         """Detect LOLbin abuse — certutil, bitsadmin, mshta, regsvr32, etc."""
         name_lower = profile.name.lower()
-        if name_lower not in self._LOLBINS:
+        if name_lower not in self._LOLBINS and name_lower not in THREAT_INTEL.lolbins():
             return
         cmdline = self._get_cmdline(profile)
         cmdline_lower = cmdline.lower()
@@ -41400,6 +48522,7 @@ class MedianBoxMonitor:
                 # Store raw snapshot for ConnectionInventory (single psutil call)
                 with self._conn_snapshot_lock:
                     self._conn_snapshot = raw_conns
+                self.conn_inventory.remember_sockets(raw_conns)
                 # Build indexed views for process watcher
                 by_pid = defaultdict(list)
                 by_raddr = {}
@@ -41818,6 +48941,7 @@ class MedianBoxMonitor:
                         self._check_behavioral_anomaly(profile, dst_ip)
                         self._check_geoip(profile, dst_ip, domains)
                         self._check_verification(profile, dst_ip, dst_port, domains)
+                        self._check_signature(profile, dst_ip, dst_port)
                         # Anti-hack: check admin share access (15) and exfil channels (17)
                         self._check_admin_share(profile, dst_ip, dst_port)
                         self._check_exfil_channel(profile, dst_ip, domains)
@@ -41838,7 +48962,7 @@ class MedianBoxMonitor:
                             if (cc in CONFIG['high_risk_countries']
                                     or dst_port in CONFIG['remote_ports']
                                     or dst_ip in self._watchlist_ips):
-                                self._whois_lookup.warm(dst_ip)
+                                self.whois_lookup.warm(dst_ip)
                         # DoH detection
                         doh_ev = self.doh_detector.check_connection(pid, name, dst_ip, dst_port)
                         if doh_ev:
@@ -45287,6 +52411,7 @@ class MedianBoxMonitor:
         base['spectrum_events'] = base['spectrum']['events']
         # Local machine GeoIP (for map "you are here" marker)
         base['local_geo'] = self._get_local_geoip()
+        GNAT.record('feed', base)
         self._full_data_cache = base
         self._full_data_built = time.time()
         return base
@@ -45295,6 +52420,19 @@ class MedianBoxMonitor:
     def run(self):
         # Start packet pipeline workers
         self.pipeline.start()
+        _cap_ok, _cap_msg = packet_capture_status()
+        self.capture_driver_ok = _cap_ok
+        if _cap_ok:
+            self._log(f"{EMOJI['ok']} Capture driver: {_cap_msg}", color=Colors.G)
+        else:
+            self._log(f"{EMOJI['alert']} {_cap_msg}", color=Colors.R)
+        if self.alerter.enabled:
+            self._log(f"{EMOJI['ok']} Out-of-band alerting enabled "
+                      f"(min severity {CONFIG['alert_webhook_min_severity']}, "
+                      f"max {CONFIG['alert_rate_per_min']}/min)", color=Colors.G)
+        if CONFIG.get('auto_response', 'off') != 'off':
+            self._log(f"{EMOJI['alert']} Auto-response mode: {CONFIG['auto_response']} "
+                      f"(score >= {CONFIG['auto_response_min_score']})", color=Colors.Y)
 
         threads = [
             threading.Thread(target=self._connection_mapper, daemon=True, name="Connection-Mapper"),
@@ -45339,7 +52477,9 @@ class MedianBoxMonitor:
             self._log(f"  Started thread: {t.name}", color=Colors.C)
 
         if HAS_FASTAPI and CONFIG.get('dashboard_enabled'):
-            self._log(f"{EMOJI['dashboard']} Dashboard: http://127.0.0.1:{CONFIG['dashboard_port']}", color=Colors.G)
+            self._log(f"{EMOJI['dashboard']} Dashboard: " +
+                      ('https' if CONFIG.get('dashboard_cert') else 'http') +
+                      f'://127.0.0.1:{CONFIG["dashboard_port"]}', color=Colors.G)
 
         # Launch GNA Tracer GUI unless --no-gui
         gui = None
@@ -45415,8 +52555,54 @@ def main():
                         help='Disable web dashboard')
     parser.add_argument('--no-geoip', action='store_true',
                         help='Disable GeoIP lookups (privacy)')
-    parser.add_argument('--siem', choices=['json', 'cef', 'syslog'],
-                        help='Enable SIEM output format')
+    parser.add_argument('--siem', choices=['json', 'cef', 'syslog', 'splunk_hec', 'elastic'],
+                        help='Enable SIEM output format (splunk_hec/elastic need --siem-url)')
+    parser.add_argument('--siem-url', default=None, help='HTTP endpoint for splunk_hec / elastic')
+    parser.add_argument('--siem-token', default=None, help='HEC token / Elastic API key')
+    parser.add_argument('--alert-webhook', default=None,
+                        help='Slack/Discord/Teams/generic webhook URL for CRITICAL alerts')
+    parser.add_argument('--alert-min-severity', choices=['INFO', 'WARNING', 'CRITICAL'], default=None)
+    parser.add_argument('--auto-response', choices=['off', 'dry_run', 'suspend'], default=None,
+                        help='Opt-in containment: suspend (reversible) top-scoring CRITICAL processes')
+    parser.add_argument('--vt-key', default=None,
+                        help='VirusTotal API key (otherwise VT_API_KEY env var)')
+    parser.add_argument('--trace', metavar='IP_OR_HOST', default=None,
+                        help='Reverse-trace an IP or hostname: owner, ASN, abuse/legal contacts, TLS cert, '
+                             'annotated router path, local owning process — and, for VPN/proxy/Tor/CDN/cloud '
+                             'endpoints, the same trace carried on to the operator. Prints and exits')
+    parser.add_argument('--trace-no-probe', action='store_true',
+                        help='With --trace: registry/DNS data only, no connection to the target')
+    parser.add_argument('--trace-deep', action='store_true',
+                        help='With --trace: also run the full MultiVerifier (ACTIVE probes of the target)')
+    parser.add_argument('--trace-no-pivot', action='store_true',
+                        help='With --trace: do not continue the trace at the operator')
+    parser.add_argument('--trace-json', action='store_true',
+                        help='With --trace: emit the structured trace as JSON')
+    parser.add_argument('--trace-out', metavar='FILE', default=None,
+                        help='With --trace: also write the report to FILE')
+    parser.add_argument('--trace-draft', metavar='FILE', default=None,
+                        help='With --trace: write a ready-to-send abuse-report / records-request e-mail to '
+                             'the operator (the lawful route to the party behind a VPN/proxy/Tor/CDN endpoint)')
+    parser.add_argument('--trace-matrix', metavar='FILE', default=None,
+                        help='Run the full trace pipeline over every IP/hostname listed in FILE '
+                             '(one per line) and print the per-channel identity-recovery matrix')
+    parser.add_argument('--trace-fuzz', metavar='N', type=int, default=0,
+                        help='Mutation-fuzz every wire parser N iterations and report any crash '
+                             '(default corpus ~300k runs) — proves the parsers cannot fail on '
+                             'malformed endpoint replies')
+    parser.add_argument('--identify-probe', metavar='SECONDS', type=int, default=0,
+                        help='Run the live identification-coverage probe for SECONDS: maps every '
+                             'real connection on this host and reports how many public endpoints '
+                             'remain unidentified — the measurable form of "identify everything"')
+    parser.add_argument('--demask-dns', metavar='ZONE', default=None,
+                        help='Authoritative DNS responder for ZONE (binds UDP :53). When a demask '
+                             'page resolves <token>.ZONE, the RESOLVER that queries here is the '
+                             "client's real DNS egress — and any EDNS client-subnet option names "
+                             'the client network itself')
+    parser.add_argument('--canary', metavar='PORT', type=int, default=None,
+                        help='Start the callback-canary HTTP listener on PORT. With --trace: mint a URL bound '
+                             'to the target — a fetch of it arrives at this host from the fetcher\'s real '
+                             'egress (a proxied party bypassing its own tunnel exposes its pre-tunnel address)')
     parser.add_argument('--port', type=int, default=None,
                         help='Dashboard port (default: 8470)')
     parser.add_argument('--workers', type=int, default=None,
@@ -45430,8 +52616,92 @@ def main():
 
     args = parser.parse_args()
 
+    if args.identify_probe:
+        load_config(args.config)
+        r = identify_probe(args.identify_probe,
+                           dump=args.trace_out or '')
+        print("\n".join(_render_identify_probe(r)))
+        return
+
+    if args.trace_matrix:
+        load_config(args.config)
+        targets = [ln.split('#', 1)[0].strip()
+                   for ln in open(args.trace_matrix, encoding='utf-8')]
+        targets = [t for t in targets if t]
+        m = trace_matrix(targets, probe=not args.trace_no_probe,
+                         pivot=not args.trace_no_pivot)
+        GNAT.record('matrix', m)
+        print("\n".join(_render_matrix(m)))
+        if args.trace_out:
+            with open(args.trace_out, 'w', encoding='utf-8') as fh:
+                fh.write(json.dumps(m, default=str, indent=2))
+        return
+
+    if args.trace_fuzz:
+        load_config(args.config)
+        r = trace_fuzz(args.trace_fuzz, seed=0)
+        print(f"FUZZ: {r['iterations']} iterations, {r['errors']} errors")
+        for name, st in sorted(r['per_parser'].items()):
+            flag = 'CLEAN' if not st['errors'] else f"{len(st['errors'])} ERRORS"
+            print(f"  {name:<28} {st['runs']:>8} runs   {flag}")
+            for exc, hx in st['errors'][:3]:
+                print(f"      ! {exc}   in={hx}")
+        return
+
+    if args.trace:
+        load_config(args.config)
+        if args.canary:
+            CONFIG['canary_port'] = args.canary
+            canary_listen(args.canary)
+        if args.demask_dns:
+            p53 = _demask_dns_listen(args.demask_dns)
+            print(f"DNS-leak authority for {args.demask_dns} "
+                  + (f"listening on :{p53}" if p53 else "FAILED — :53 needs admin/root"))
+        # One trace, every output form: text report, JSON, abuse draft.
+        d = trace_data(args.trace, probe=not args.trace_no_probe,
+                       pivot=False if args.trace_no_pivot else None, deep=args.trace_deep)
+        report = json.dumps(d, default=str, indent=2) if args.trace_json else "\n".join(_render_trace(d))
+        saved_to = GNAT.save_trace(args.trace, d, report)
+        print(report)
+        if saved_to:
+            print(f'[gnat] trace feed recorded -> {saved_to}')
+        for path, text in ((args.trace_out, report), (args.trace_draft, trace_abuse_draft(d))):
+            if path:
+                with open(path, 'w', encoding='utf-8') as fh:
+                    fh.write(text + chr(10))
+        if args.canary:
+            print(f"Canary listener stays up on :{args.canary} while this process runs — Ctrl-C to stop.")
+            try:
+                while True:
+                    time.sleep(3600)
+            except KeyboardInterrupt:
+                pass
+        return
+
     # Load YAML config first
     load_config(args.config)
+    if args.canary:
+        CONFIG['canary_port'] = args.canary
+        try:
+            canary_listen(args.canary)
+        except Exception as exc:
+            _logger.warning("canary listener failed: %s", exc)
+    if args.demask_dns:
+        p53 = _demask_dns_listen(args.demask_dns)
+        if not p53:
+            _logger.warning("DNS-leak authority failed to bind :53 (needs admin/root)")
+    if args.siem_url:
+        CONFIG['siem_url'] = args.siem_url
+    if args.siem_token:
+        CONFIG['siem_token'] = args.siem_token
+    if args.alert_webhook:
+        CONFIG['alert_webhook_url'] = args.alert_webhook
+    if args.alert_min_severity:
+        CONFIG['alert_webhook_min_severity'] = args.alert_min_severity
+    if args.auto_response:
+        CONFIG['auto_response'] = args.auto_response
+    if args.vt_key:
+        os.environ['VT_API_KEY'] = args.vt_key
 
     # CLI overrides
     if args.no_dashboard:

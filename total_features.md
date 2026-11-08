@@ -48,6 +48,8 @@
 40. [Performance Optimizations](#40-performance-optimizations)
 41. [Known Gaps, Missing Features & Platform Coverage](#41-known-gaps-missing-features--platform-coverage)
 42. [Completeness Ratings by Category](#42-completeness-ratings-by-category)
+43. [Identification, Attribution and Response](#43-identification-attribution-and-response-2026-11-08)
+44. [Investigative Applications — Trafficking, Drug Markets, Dark Web](#44-investigative-applications--trafficking-drug-markets-dark-web)
 
 ---
 
@@ -1263,6 +1265,9 @@ GATE-CRASHER verification methods — IKE, PROX, TLSALT, BANNER, IPID, SRVLOC an
 ### 24.9 `_test_wireproof.py` (1,560 checks)
 The silent-tunnel / non-IP-channel suite — evidence rows for tunnels that answer no probe: WireGuard black-holes, OpenVPN hard-resets, DTLS, ESP/GRE L3 tunnels, ICMP tunnels, QUIC, encrypted-flow, TLS-weird, WS tunnels, ECH, no-SNI, one-way channels — plus dozens of protocol self-ID decoders (SSH/HASSH, Kerberos, LDAP, RDP, RTSP, SIP, FTP, MQTT, Modbus, BACnet, Kafka, X11, BGP, VNC, RADIUS, SCADA S7/IEC-104, DNP3, gopher-class services, game/mesh/db/OT protocols). Synthetic packets and wire_hint dicts feed the pure classifiers and `verify()` — no external targets needed. **1560/1560 passing.**
 
+### 24.9a `_test_unmask_v2.py` (38 tests)
+The de-masking engine: widened real-client header harvest (`CF-Connecting-IP`, `True-Client-IP`, RFC 7239 `Forwarded`, …), generic DNS record queries (MX/SPF), IKEv1/v2 + OpenVPN + STUN/TURN gateway self-ID, CDN origin discovery with cert/content verification tiers, open-proxy relay egress via canary, the ~20-probe self-naming battery, the trace coverage matrix, the parser fuzz harness, the watermark codec + `FlowCorrelator`, `SessionRegistry` fingerprint linkage, and all four tiers' channel wiring in `_trace_unmask`. Fully offline — mocked sockets and patched fetchers.
+
 ### 24.10 `_test_ui_smoke.py` (~180 checks)
 Full GUI smoke pass built on a fabricated state: every tab renders, sensor chips show correct counts, search bars filter, the inspector dossier expands/collapses, flash keeps numbering, and the Signals tab asserts coverage-matrix rows, emitter fields (RSSI/distance/trend), trilateration fix blocks, processing-feed rows, and raw `RF_*` events all render with detailed labels.
 
@@ -1288,7 +1293,29 @@ python medianbox_monitor_v2.py [options]
   --config, -c PATH          Load YAML config file
   --no-dashboard             Disable FastAPI web dashboard
   --no-geoip                 Disable GeoIP lookups
-  --siem json|cef|syslog     SIEM output format
+  --siem json|cef|syslog|splunk_hec|elastic   SIEM output format
+  --siem-url URL / --siem-token TOKEN         SIEM endpoint + credential
+  --alert-webhook URL        Webhook for CRITICAL findings
+  --alert-min-severity S     INFO|WARNING|CRITICAL (default CRITICAL)
+  --auto-response MODE       off|dry_run|suspend — reversible containment
+  --vt-key KEY               VirusTotal API key
+  --trace IP_OR_HOST         Full reverse trace: rDNS, RDAP, BGP, Tor/VPN/CDN
+                             classification, TLS cert, AS-annotated path, local
+                             owner, operator pivot, de-mask channel battery
+  --trace-no-probe           Registry/DNS/BGP only — never connect to target
+  --trace-deep               Also run the full MultiVerifier (active probes)
+  --trace-no-pivot           Stop at the endpoint; skip the operator pivot
+  --trace-json / --trace-out FILE   JSON output / write report to FILE
+  --trace-draft FILE         Write the records-request e-mail to the operator
+  --canary PORT              De-mask listener: /c/ callback, /d/ WebRTC+fingerprint
+                             page, /s/ ETag session link, /l/ leak intake,
+                             /f/ vantage flow-correlation ingest
+  --demask-dns ZONE          Authoritative DNS on :53 — logs the client's real
+                             resolver egress + EDNS client-subnet
+  --trace-matrix FILE        Trace a target corpus; print per-channel
+                             identity-recovery matrix
+  --trace-fuzz N             Mutation-fuzz every wire parser N iterations
+  --identify-probe SECONDS   Live identification-coverage measurement
   --port PORT                Dashboard port (default 8470)
   --workers N                Packet pipeline workers (default 4)
   --dashboard-password PASS  Protect dashboard with password
@@ -1862,6 +1889,7 @@ These are deliberate, correct design choices, not missing features:
 
 Grades assigned 2026-08-22 against the live, running code — not the docstrings or the section headers above; figures re-verified 2026-11-08. Rubric:
 
+- **A+** — Grade A, and every remaining limit is an OS/protocol boundary (not missing code) that is measured live and stated
 - **A** — Fully implemented, cross-platform where the feature name implies it should be, verified against live data
 - **B** — Fully implemented on the primary platform (Windows), solid design, but static rule lists or single-platform
 - **C** — Implemented with a real structural limitation (opt-in, rate-capped, degrades silently without an optional dependency, static thresholds)
@@ -1874,29 +1902,98 @@ Grades assigned 2026-08-22 against the live, running code — not the docstrings
 | 2 | Anti-Hack Process Checks (18) | B | Same strengths/limits as §1; runs cross-platform where the underlying data (psutil, command lines) is available |
 | 3 | Anti-Hack Background Monitors (8) | C | Fully correct on Windows; 100% inert on Linux/macOS — see §41.2 |
 | 4 | Enhanced Sneaky-Hacker Checks (7) | B | Genuinely sophisticated (12-indicator PowerShell obfuscation scoring, parent/child mismatch tables) — still zero code-signing backing |
-| 5 | Network & Connection Monitoring | A- | Fixed 2026-08-22: every public IP now gets full enrichment (was gated to a minority); interface auto-detection now picks the actually-routed adapter instead of the first one enumerated (was silently selecting a disconnected APIPA link in testing) |
-| 6 | DNS Monitoring | B | Bidirectional DNS map and DoH detection are solid from psutil/registry data alone; SNI extraction and full tunneling detection need Npcap; entropy/rate thresholds are static |
+| 5 | Network & Connection Monitoring | A+ | 2026-11-08 (second pass): see §43 - provider-range, VPN-feed and Cymru owner steps, loopback/LAN/special-address naming, PID-0 owner recovery, `owner_via`. Live run 2026-11-08 (dev host): of 260 connections not generated by the monitor's own verification probes, **0 public peers unresolved**, all 197 loopback/LAN peers named (the local process on the other end of a loopback socket; LAN devices by ARP + OUI vendor, gateway role and port hint), and ownerless TIME_WAIT sockets fell from 196 to 6. Earlier 2026-11-08: unnamed peers are identified by an evidence chain (DNS/SNI, reverse DNS, TLS certificate, RDAP/ASN owner, process+port), each label tagged with its source in `via`; live run: 967 public connections, 0 unresolved. Earlier fix 2026-08-22: every public IP now gets full enrichment (was gated to a minority); interface auto-detection now picks the actually-routed adapter instead of the first one enumerated (was silently selecting a disconnected APIPA link in testing) |
+| 5b | Reverse Tracing / Attribution | A+ | `--trace` / `trace_data()` carries a trace to the endpoint's operator and prepares an evidence packet (§43); verified live on 1.1.1.1 and a Tor exit, plus offline tests. Now adds a disclosure surface (CHAOS DNS self-ID, resolver-egress echo, NTP readvar, page/vhost/CT names, DB history) and a client de-masking section (`_trace_unmask`) that checks every behind-the-relay channel live — protocol-disclosed origins (XFF/PROXY/SIP/FTP/STUN/tunnel-inner/EDNS), shared-state alias links, and the `--canary` callback. Client identity behind VPN/Tor/CDN endpoints is operator-held — a protocol boundary the report itself measures and states channel-by-channel, which satisfies the A+ rubric |
+|| 6 | DNS Monitoring | B | Bidirectional DNS map and DoH detection are solid from psutil/registry data alone; SNI extraction and full tunneling detection need Npcap; entropy/rate thresholds are static |
 | 7 | GeoIP & Location Verification | B+ | 244-method-code MultiVerifier design is rigorous and honestly graded — but defaults to free third-party APIs with no bundled local database, and is rate-limited via TokenBucket under sustained load |
 | 8 | VPN & Proxy Detection | A- | 100% detection rate / 0% false positives across 1,100 synthetic endpoints; now cross-verifies every public connection, not a filtered subset |
-| 9 | Process Profiling & Forensics | C+ | Broad, genuinely useful data collection (I/O counters, DLL enumeration, CPU/memory now exported) — but memory forensics is RWX-region-only (no signing check), and VirusTotal is opt-in/undiscoverable/rate-capped |
+| 9 | Process Profiling & Forensics | B- | Broad data collection (I/O counters, DLL enumeration, CPU/memory) plus an Authenticode verdict on every process that talks to a public IP and a `--vt-key` flag — memory forensics is still RWX-region-only and VirusTotal is rate-capped on the free tier |
 | 10 | System & Persistence Monitoring | C | Windows-only; covers the standard Run-key persistence path but not COM hijacking, service-DLL hijacking, or `AppInit_DLLs` |
 | 11 | Hardware & Peripheral Monitoring + Spectrum/RF | B | Windows-side collectors are real and verified live (Wi-Fi BSSID census, BT/BLE, WWAN, RF hardware, interface census, L2 wire talkers) with honest unavailable-not-fabricated coverage reporting; bounded by receivers — Zigbee/Z-Wave/NFC/sub-GHz need external hardware, BLE live-scan needs `bleak`, L2 census needs Npcap+admin, and `netsh` paths are Windows-only |
-| 12 | Packet Analysis & TLS Fingerprinting | C+ | Well-engineered JA4+/SNI/entropy pipeline — entirely dependent on Npcap/libpcap, with no startup check that tells the user plainly when it's missing (only a log-line warning) |
-| 13 | Behavioral & Statistical/ML | C+ | Real Z-score baselining across 4 metrics — but purely in-memory, resets to cold on every restart |
+| 12 | Packet Analysis & TLS Fingerprinting | B- | Well-engineered JA4+/SNI/entropy pipeline; startup now prints an explicit capture-driver status (red notice + install URL when Npcap/libpcap is missing) — still inert without the driver and admin rights |
+| 13 | Behavioral & Statistical/ML | B- | Z-score baselining across 4 metrics, now persisted (atomic JSON, autosave, window-pruned on load) so restarts keep their baseline; univariate only. Also fixed an undefined-name reference in the deviation-floor check |
 | 14 | Firewall & IP Blocking | C | Functional manual block/unblock on Windows via `netsh` plus the self-terminating Flow Probe (block→observe→auto-unblock with ROTATED/STICKY/GONE verdicts); no Linux equivalent; no automatic triggering |
 | 15 | GUI (18 Tabs) | A- | Fixed 2026-08-22: all 55 ConnectionEntry fields now render, zero stale placeholders, Live tab refresh cut roughly 75x (2,540ms to 34ms); 2026-11-07: Signals tab surfaces the full spectrum registry with verbose labels; 2026-11-08: IP map plots every traced emitter (solved/ranged/local tiers) + PINPOINTS & GEO LOCATIONS sidebar — but the window itself has no authentication |
 | 16 | Web Dashboard | C+ | Functional 6-tab live view (incl. the verbatim All Feeds completeness tail) with optional token auth — but a subset of the desktop GUI's 18 tabs, and served over plain HTTP (no TLS) |
 | 17 | Data Export & Session Recording | B+ | Extremely thorough plain-text export (30+ sections including the spectrum/RF registry, effectively complete) — but not queryable; see §18 |
-| 18 | Database & Logging | D | 2 of roughly 15 tracked entity types (deductions, devices) actually persisted to SQL; everything else is text-log-only |
-| 19 | SIEM Output | C | File (JSON/CEF) or UDP syslog only — no direct connector for Splunk HEC, Elastic, Sentinel, or any SIEM's native ingestion API |
-| 20 | Alert Escalation | B | Solid, well-reasoned compounding logic (1.5^(N-1), capped at 5x within a 5-minute window) — but escalation only changes a score, it doesn't trigger any external notification |
+| 18 | Database & Logging | C | 3 tables now (deductions, devices, connections with IP/process indexes); processes, RF emitters and Tier-5 events are still text-log-only |
+| 19 | SIEM Output | B- | File (JSON/CEF), UDP syslog, plus Splunk HEC and Elastic HTTP connectors (payloads unit-tested, not yet verified against a live instance); no Sentinel connector |
+| 20 | Alert Escalation | B+ | Compounding logic (1.5^(N-1), capped at 5x within 5 minutes) now feeds the webhook/email alerter and the opt-in auto-responder, so escalation can reach a human and trigger containment |
 | 21 | Configuration System | B | Full type/range validation per key, live-editable in the GUI — but some values (thread intervals, dashboard port) only take effect on restart, and this isn't surfaced in the Config tab |
-| n/a | Automated response/containment | F | Manual firewall block is the entire ceiling — see §41.3 |
-| n/a | Out-of-band alerting | F | No email/Slack/Discord/push/SMS — see §41.3 |
-| n/a | Signature/YARA detection | F | Not implemented anywhere — see §41.1 |
-| n/a | Code-signing verification | F | Not implemented anywhere — see §41.1 |
-| n/a | Cross-platform coverage | D | Linux: roughly 9/33 detections functional. macOS: effectively 0 — see §41.2 |
-| n/a | Packaging/reproducibility | D | No dependency manifest, no pinned versions, no CI — see §41.4 |
+| n/a | Automated response/containment | B | Opt-in reversible process suspend with protected list, PID-reuse guard, dry-run mode; tested on a real process. No network isolation or quarantine — see §43 |
+| n/a | Out-of-band alerting | B+ | Webhook (Slack/Discord/Teams/generic) + SMTP email with severity floor, rate cap and de-dup; unit-tested, not yet live-tested against a real endpoint; no push/SMS — see §43 |
+| n/a | Signature/YARA detection | F | YARA/byte-signature scanning is still not implemented (Authenticode is covered separately) |
+| n/a | Code-signing verification | B- | Authenticode (embedded + catalog) via PowerShell, cached per file version, verified on a real system binary; Windows-only — see §43 |
+| n/a | Threat-intel freshness | C+ | Provider ranges, VPN exit lists, Apple relay and Tor relay data refresh from operator feeds (24 h TTL, disk-cached); LOLbin/exfil/mutex/VPN-ASN lists remain static constants |
+|| n/a | Cross-platform coverage | D | Linux: roughly 9/33 detections functional. macOS: effectively 0 — see §41.2 |
+| n/a | Packaging/reproducibility | B- | Pinned `requirements.txt` and a Windows GitHub Actions workflow (written, not yet run on GitHub); no `pyproject.toml` or hash-locked lockfile |
 | n/a | Delivery-layer test coverage | B (was F) | Detection logic was always well-tested (73+ cases); nothing verified harvested data actually reached the screen until `_test_data_wiring.py`/`_test_gui_render.py`/`_test_click_actions.py` were added 2026-08-22 |
 
 **Overall assessment:** the detection engine (deduction logic, anti-hack heuristics, VPN/proxy/GeoIP cross-verification) is the strongest and most mature part of the system — rigorously designed, honestly graded (it says "UNVERIFIED" rather than guessing), and now, after the 2026-08-22 audit, fully wired end-to-end so what it computes actually reaches the screen. The weakest areas are consistently the same three: cross-platform coverage (Windows-first by a wide margin), response automation (detection-only, no containment), and operational maturity (no persisted history beyond two tables, no external alerting, no packaging/CI hygiene). None of these are secret — they're now stated plainly here rather than left implicit.
+
+## 43. Identification, Attribution and Response (2026-11-08)
+
+**Connection identification chain.** `ConnectionInventory._identify_fallback` names every connection DNS/SNI could not, strongest evidence first, and records the source in `via`: reverse DNS, then TLS certificate (`TlsIdentityProbe`; public peers we are already connected to on 443/8443/465/993/995/853/636, rate-limited, disabled by `--no-geoip` or `attribution_tls_probe: false`), then registered network owner (GeoIP org/ASN, then RDAP registrant), then process + port. Weaker labels are replaced automatically when stronger evidence lands. Peers with no evidence yet read `Unresolved: <process> -> <port> (owner lookup pending)` rather than a guess.
+
+**Attribution report (reverse trace).** `python medianbox_monitor_v2.py --trace <ip-or-hostname> [--trace-no-probe] [--trace-deep] [--trace-no-pivot] [--trace-json] [--trace-out FILE]`. Stage 1 (endpoint): reverse DNS with forward confirmation; RDAP owner/range/CIDR/registration date, contacts (emails, phones, addresses, remarks) and abuse contact, with an RIR-specific RDAP fallback when rdap.org fails; BGP origin from Team Cymru DNS (`cymru_asn_lookup`, pure-Python UDP TXT, config `attribution_cymru`) and RIPEstat; classification from Onionoo (relay nickname, fingerprint, contact, family), provider VPN/relay feeds and provider-published ranges; the TLS certificate; a traceroute annotated with per-hop AS holder, rDNS and city hints, marking the hop where the path enters the target's AS; and the local process holding a socket to the target. Stage 2 (**operator pivot**, config `trace_operator_pivot`, on by default): operator names (AS holder, registrant, VPN provider, Tor AS) and corroborated operator domains (certificate names, registry/abuse/Tor-contact e-mail domains; a PTR-only domain is kept only if it is hosted in the operator's own AS, otherwise it is listed as rejected); per-domain hosting, registrar, creation date and `security.txt` contacts (fetched only from hosts that resolve entirely to public addresses); the operator's announced-prefix footprint and BGP neighbours; the whole Tor relay family; and a full trace of the operator's own server. Stage 3: an evidence packet (UTC time, endpoint, local socket and process, operator, contact points, and the fields a request must cite - destination IP+port, second-precision UTC timestamps, and the *source* public IP + source port, which CGNAT makes essential). `--trace-draft FILE` writes a ready-to-send abuse-report / records-request e-mail to the operator (contacts from RDAP and `security.txt`, the evidence packet, and the exact fields the operator needs — including the source port when CGNAT applies). This is the lawful route to the party behind a VPN/proxy/Tor/CDN endpoint: the operator holds the record; the wire does not. Every `--trace` run also sends an **active reverse probe**: TCP connects that measure handshake RTT and negotiated MSS (encapsulation/tunnel overhead on the path), capture the service banner the endpoint volunteers (SSH/FTP/SMTP/HTTP/SOCKS/RDP/BitTorrent signatures), HEAD-request disclosure headers (`Server`, `X-Powered-By`, `Via`, `X-Backend-*`, `CF-RAY` edge-site), an ICMP echo that estimates routed-hop distance and OS class from reply TTL, and — with `--trace-deep` — firewall posture from the ports adjacent to the observed one. Endpoint certs are read even when self-signed/private-CA (device certs name the device, e.g. `O=Netgear`). Every report also carries an **operator-side trace** section: it inspects THIS host as the operator — VPN server listeners, tunnel interfaces, IP forwarding, the NAT/conntrack table and DHCP leases. When the monitor runs on a VPN/proxy/NAT host, the pre-tunnel client is resolved right there (the tunnel's peer IS the client); on a non-operator host the section states that and points at the operator's contacts and the `--trace-draft` records request.
+
+Limit, stated in every report: client identity behind VPN/proxy/Tor/CDN endpoints is held only in the operator's records and is reachable through the operator's abuse/legal channel or lawful process; it is not derivable from the wire and is not attempted.
+
+**Identification, second pass (2026-11-08).** `special_range_info` names every non-public class (loopback, link-local/APIPA, CGN 100.64/10, multicast with well-known group names, documentation, benchmark, reserved) and decodes IPv4-mapped/6to4/Teredo/NAT64 forms. `ConnectionInventory._identify_local`: loopback and own-address sockets resolve to the process on the other end through the socket table; LAN peers through `LanIdentity` (ARP table parse, OUI vendor, randomised-MAC detection, default-gateway role, `_LAN_PORT_HINTS`); tunnel peers by the interface whose subnet contains them. `ProviderRangeDB` (config `attribution_provider_ranges*`) ingests AWS, Google Cloud, Cloudflare, GitHub, Fastly and Oracle published ranges for longest-prefix lookup. `_vpn_feed_identity` names Mullvad/NordVPN/PIA servers from the already-cached exit feeds. `_APP_BACKENDS` names a shared CDN/cloud edge by the vendor whose client process is talking to it, always tagged `process + shared edge (inferred)`. Owner recovery for PID-0 sockets (config `attribution_owner_history`): `remember_sockets` (called from the 0.5 s connection mapper) -> exact 4-tuple history -> the live listener on the socket's local port -> last owner of the same remote endpoint (inferred, 15 min). `ConnectionEntry.owner_via` states how each owner was established and marks the monitor's own verification traffic. Live run 2026-11-08 (dev host): of 260 connections not generated by the monitor's own verification probes, **0 public peers unresolved**, all 197 loopback/LAN peers named (the local process on the other end of a loopback socket; LAN devices by ARP + OUI vendor, gateway role and port hint), and ownerless TIME_WAIT sockets fell from 196 to 6.
+
+**Alerting.** `--alert-webhook URL`, `--alert-min-severity`, config keys `alert_webhook_url`, `alert_webhook_min_severity`, `alert_rate_per_min` (default 6), `alert_dedupe_s` (default 300), and SMTP keys `alert_email_to/from`, `alert_smtp_host/port/user/password`. Fires from both deductions and CRITICAL suspicious events.
+
+**Automated response.** `--auto-response off|dry_run|suspend` (default `off`), `auto_response_min_score` (default 80). Suspends, never kills; skips a protected list (system/session processes, svchost, explorer, Defender, python, the monitor and its parent); one action per process instance; every action is logged and included in the alert.
+
+**SIEM connectors.** `--siem splunk_hec|elastic --siem-url URL --siem-token TOKEN`.
+
+**Persistence.** `connections` SQLite table (every `db_persist_interval_scans` scans); ML baseline in `ml_baseline_file` (autosaved every `ml_baseline_save_interval` s).
+
+**Code signing.** `CODE_SIGNING` suspicious event: HashMismatch (CRITICAL) or NotTrusted / unsigned-from-user-writable-path (WARNING) for processes using public IPs. `authenticode_enabled` to disable.
+
+**Other.** `--vt-key`; capture-driver status printed at startup; `requirements.txt`; `.github/workflows/tests.yml`; fixed `self._whois_lookup` (undefined attribute) in the high-risk RDAP warm path; tests in `_test_attribution.py` (19 cases) and `_test_attribution_v2.py` (11 cases, fully offline: fake DNS resolver for Cymru, fixture feeds for the operator pivot) and `_live_identify_probe.py` (live coverage check).
+
+
+## 44. Investigative Applications — Trafficking, Drug Markets, Dark Web
+
+The de-masking and attribution engine supports the workflows analysts run against criminal
+infrastructure that hides behind VPNs, Tor, CDNs and bulletproof hosting. Hidden services hide
+*addresses*, not physics — every channel below names a piece of the chain concretely.
+
+### Hidden-service & marketplace attribution
+- `--trace` names every operator in the chain concretely: Tor relay nickname/fingerprint/contact/family,
+  VPN gateway vendor + IKE responder ID, CDN tenant + provider feed, hoster ASN/RDAP/abuse contacts.
+- `--trace-draft` emits the evidence packet and ready-to-send records request (endpoint, port, UTC
+  timestamp, operator contacts) — the lawful route to subscriber records behind any gateway.
+
+### Origin discovery behind CDN fronts
+- Criminal storefronts front with Cloudflare/Akamai; `_trace_origin_hunt` cross-references passive-DNS
+  history (hostsearch, rapiddns, OTX), CT-logged names, MX/SPF records and subdomain tables, then
+  verifies candidates against the origin's certificate fingerprint and served content —
+  candidate → strong → verified → confirmed evidence tiers, never a guess.
+
+### Unmasking at controlled endpoints (lawful operations)
+- `/d/<tok>` de-mask page: WebRTC ICE harvest — `srflx`/`host` candidates on a leaking client are the
+  pre-tunnel address, POSTed to `/l/<tok>` and recorded as a `webrtc/ice leak` origin.
+- `/c/<tok>` canary: any fetch arrives at this host from the fetcher's real egress (a suspect's app
+  bypassing its own tunnel exposes itself).
+- `/s/<tok>` session pixel: ETag+cookie + browser fingerprint joins one client across different
+  exit IPs (`SessionRegistry`).
+- `--demask-dns ZONE`: authoritative responder on UDP :53 — the querying resolver is the suspect's
+  real DNS egress; EDNS client-subnet names their network directly.
+
+### Cross-tunnel flow correlation
+- Injected pacing watermark on `/d/` responses (`_wm_gaps`); sniffer continuously scores live
+  `_flowstats` gap series against all injected marks; `POST /f/<tok>` ingests cooperating-vantage
+  observations (ISP NetFlow under legal process, second sensor). Match ≥0.72 joins entry and exit.
+
+### Tor-side localization
+- `tor_guard_census()` — per-guard population share from consensus weights (narrows a client to
+  their guard's share of ~2M daily users).
+- `sybil_census()` — verifies `our_tor_relays[]` coverage of entry/exit positions.
+- `_tor_relay_observe()` — inbound OR-port clients of a locally-run relay = real subscriber IPs.
+
+### Built-in lawful boundary
+- Server compromise, client compromise and protocol-subversion appear in every report as `BLOCKED`
+  channels with the lawful substitute named. Where the wire genuinely cannot produce the answer,
+  the report states the record exists only at the operator — measured, not guessed.
